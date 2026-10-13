@@ -6,6 +6,7 @@ pub mod safetensors;
 pub mod tokenizer;
 
 use safetensors::Weights;
+use tokenizer::Tokenizer;
 
 pub struct Model {
     pub file: File,
@@ -13,6 +14,7 @@ pub struct Model {
     /// Offset of the safetensors data section within `map`.
     pub data_start: usize,
     pub weights: Weights,
+    pub tokenizer: Tokenizer,
 }
 
 impl Model {
@@ -41,11 +43,16 @@ pub fn load_model(config: ModelConfig<'_>) -> color_eyre::Result<Model> {
         color_eyre::eyre::bail!("model.safetensors header length {len} exceeds file size");
     };
     let weights = safetensors::parse_header(header, map.len() - data_start)?;
+    let tokenizer = Tokenizer::load(
+        config.tokenizer_json_path,
+        config.tokenizer_config_json_path,
+    )?;
 
     Ok(Model {
         file,
         map,
         data_start,
         weights,
+        tokenizer,
     })
 }
