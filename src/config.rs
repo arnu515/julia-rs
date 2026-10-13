@@ -7,6 +7,10 @@ use serde::Deserialize;
 /// not in any config file; the Rust side has to know the mapping anyway.
 pub const N_QTYPES: usize = 3;
 
+/// Per-head width of every attention (encoder and head). It's a const so attention can keep a
+/// head's accumulators in registers; `ModelConfig::load` checks the config agrees.
+pub const HEAD_DIM: usize = 64;
+
 #[derive(Debug)]
 pub struct ModelConfig {
     /// Hidden size D, shared by the encoder and head.
@@ -80,10 +84,16 @@ impl ModelConfig {
             enc.num_hidden_layers
         );
         ensure!(
-            enc.hidden_size.is_multiple_of(enc.num_attention_heads),
-            "hidden_size {} is not divisible by num_attention_heads {}",
+            enc.hidden_size == enc.num_attention_heads * HEAD_DIM,
+            "head dim is hidden_size {} / num_attention_heads {}, but only {HEAD_DIM} is supported",
             enc.hidden_size,
             enc.num_attention_heads
+        );
+        let head_heads = (enc.hidden_size / 64).max(1);
+        ensure!(
+            enc.hidden_size == head_heads * HEAD_DIM,
+            "head attention has {head_heads} heads over hidden_size {}, not {HEAD_DIM} per head",
+            enc.hidden_size
         );
         let global = enc
             .layer_types
@@ -107,7 +117,7 @@ impl ModelConfig {
             rope_theta_local: enc.rope_parameters.sliding_attention.rope_theta,
             norm_eps: enc.norm_eps,
             head_layers: julia.head_layers,
-            head_heads: (enc.hidden_size / 64).max(1),
+            head_heads,
             head_ff: 4 * enc.hidden_size,
         })
     }

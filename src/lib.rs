@@ -8,6 +8,7 @@ use std::{
 use color_eyre::eyre::{bail, ensure};
 use memmap2::Mmap;
 
+pub mod attn;
 pub mod config;
 pub mod matmul;
 pub mod safetensors;
