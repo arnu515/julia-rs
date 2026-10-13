@@ -1,4 +1,9 @@
-use std::fs::File;
+#![feature(portable_simd)]
+
+use std::{
+    fs::File,
+    simd::{StdFloat, f32x8, num::SimdFloat},
+};
 
 use color_eyre::eyre::{bail, ensure};
 use memmap2::Mmap;
@@ -25,6 +30,60 @@ impl Model {
     /// The data section; `Tensor` offsets are relative to this.
     pub fn data(&self) -> &[u8] {
         &self.map[self.data_start..]
+    }
+
+    pub fn embed(&self, tokens: &[u32]) -> Vec<f32> {
+        let embeddings = self.weights.encoder.tok_embeddings.as_f32(self.data());
+        let norms = self.weights.encoder.emb_norm.as_f32(self.data());
+        let h = self.config.hidden;
+        let mut x = Vec::with_capacity(h * tokens.len());
+        for (i, &t) in tokens.iter().enumerate() {
+            let t = t as usize;
+            x.extend_from_slice(&embeddings[(t * h)..((t + 1) * h)]);
+            layernorm(
+                &mut x[(i * h)..((i + 1) * h)],
+                norms,
+                None,
+                self.config.norm_eps,
+            );
+        }
+        x
+    }
+}
+
+fn layernorm(row: &mut [f32], norms: &[f32], biases: Option<&[f32]>, eps: f32) {
+    assert!(row.len().is_multiple_of(8) && norms.len() == row.len());
+    let n = row.len() as f32;
+    let (chunks, _) = row.as_chunks::<8>();
+    let mean = chunks
+        .iter()
+        .map(|&c| f32x8::from_array(c))
+        .sum::<f32x8>()
+        .reduce_sum()
+        / n;
+    let mean = f32x8::splat(mean);
+    let factor = {
+        let mut acc = f32x8::splat(0.0);
+        for &c in chunks {
+            let d = f32x8::from_array(c) - mean;
+            acc = d.mul_add(d, acc);
+        }
+        f32x8::splat(1.0 / (acc.reduce_sum() / n + eps).sqrt())
+    };
+
+    let (row, _) = row.as_chunks_mut::<8>();
+    let (norms, _) = norms.as_chunks::<8>();
+    if let Some(biases) = biases {
+        let (biases, _) = biases.as_chunks::<8>();
+        for ((row, &norm), &bias) in row.iter_mut().zip(norms).zip(biases) {
+            *row = ((f32x8::from_array(*row) - mean) * factor)
+                .mul_add(f32x8::from_array(norm), f32x8::from_array(bias))
+                .to_array();
+        }
+    } else {
+        for (row, &norm) in row.iter_mut().zip(norms) {
+            *row = ((f32x8::from_array(*row) - mean) * factor * f32x8::from_array(norm)).to_array();
+        }
     }
 }
 
