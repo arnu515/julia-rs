@@ -3,13 +3,7 @@ use std::collections::HashMap;
 use color_eyre::eyre::{bail, ensure, eyre};
 use serde::Deserialize;
 
-pub const D: usize = 384;
-pub const VOCAB: usize = 256_000;
-pub const N_TYPES: usize = 3;
-pub const N_ENC: usize = 22;
-pub const N_HEAD: usize = 2;
-pub const ENC_MLP_HIDDEN: usize = 1152;
-pub const HEAD_FF: usize = 1536;
+use crate::config::{ModelConfig, N_QTYPES};
 
 /// Byte range of a tensor inside the data section (after the 8-byte length + header).
 #[derive(Clone, Copy, Debug)]
@@ -38,17 +32,17 @@ pub struct EncoderLayer {
     pub wqkv: Tensor,              // [3*D, D]
     pub wo: Tensor,                // [D, D]
     pub mlp_norm: Tensor,          // [D]
-    pub wi: Tensor,                // [2*ENC_MLP_HIDDEN, D]
-    pub wo_mlp: Tensor,            // [D, ENC_MLP_HIDDEN]
-    pub global: bool,              // i % 3 == 0
+    pub wi: Tensor,                // [2*intermediate, D]
+    pub wo_mlp: Tensor,            // [D, intermediate]
+    pub global: bool,              // full attention (else sliding window), from `layer_types`
 }
 
 #[derive(Debug)]
 pub struct Encoder {
-    pub tok_embeddings: Tensor, // [VOCAB, D]
-    pub emb_norm: Tensor,       // [D]
-    pub layers: [EncoderLayer; N_ENC],
-    pub final_norm: Tensor, // [D]
+    pub tok_embeddings: Tensor,    // [VOCAB, D]
+    pub emb_norm: Tensor,          // [D]
+    pub layers: Vec<EncoderLayer>, // n_layers
+    pub final_norm: Tensor,        // [D]
 }
 
 #[derive(Debug)]
@@ -57,9 +51,9 @@ pub struct HeadLayer {
     pub in_proj_b: Tensor,  // [3*D]
     pub out_proj_w: Tensor, // [D, D]
     pub out_proj_b: Tensor, // [D]
-    pub linear1_w: Tensor,  // [HEAD_FF, D]
-    pub linear1_b: Tensor,  // [HEAD_FF]
-    pub linear2_w: Tensor,  // [D, HEAD_FF]
+    pub linear1_w: Tensor,  // [head_ff, D]
+    pub linear1_b: Tensor,  // [head_ff]
+    pub linear2_w: Tensor,  // [D, head_ff]
     pub linear2_b: Tensor,  // [D]
     pub norm1_w: Tensor,    // [D]
     pub norm1_b: Tensor,    // [D]
@@ -80,13 +74,10 @@ pub struct Scorer {
 #[derive(Debug)]
 pub struct Weights {
     pub encoder: Encoder,
-    pub type_emb: Tensor, // [N_TYPES, D]
-    pub head: [HeadLayer; N_HEAD],
+    pub type_emb: Tensor,     // [N_QTYPES, D]
+    pub head: Vec<HeadLayer>, // head_layers
     pub scorer: Scorer,
 }
-
-/// Number of tensors we read. `act_head.*` and `temperature` are present in the file but unused.
-const N_USED: usize = 3 + 1 + 6 + N_ENC * 6 - 1 + N_HEAD * 12;
 
 #[derive(Deserialize)]
 struct RawTensor<'a> {
@@ -104,8 +95,10 @@ struct Header<'a> {
 }
 
 /// `data_len` is the size of the data section (file length - 8 - header length).
-pub fn parse_header(raw: &[u8], data_len: usize) -> color_eyre::Result<Weights> {
+/// Every tensor's shape is checked against the dimensions in `cfg`.
+pub fn parse_header(raw: &[u8], data_len: usize, cfg: &ModelConfig) -> color_eyre::Result<Weights> {
     let header: Header = serde_json::from_slice(raw)?;
+    let d = cfg.hidden;
 
     if header.metadata.len() != 2
         || header.metadata.get("family") != Some(&"julia")
@@ -148,72 +141,70 @@ pub fn parse_header(raw: &[u8], data_len: usize) -> color_eyre::Result<Weights> 
             attn_norm: match (i, header.tensors.contains_key(attn_norm.as_str())) {
                 (0, false) => None,
                 (0, true) => bail!("`{attn_norm}` should not exist"),
-                _ => Some(get(&attn_norm, &[D])?),
+                _ => Some(get(&attn_norm, &[d])?),
             },
-            wqkv: get(&format!("{p}attn.Wqkv.weight"), &[3 * D, D])?,
-            wo: get(&format!("{p}attn.Wo.weight"), &[D, D])?,
-            mlp_norm: get(&format!("{p}mlp_norm.weight"), &[D])?,
-            wi: get(&format!("{p}mlp.Wi.weight"), &[2 * ENC_MLP_HIDDEN, D])?,
-            wo_mlp: get(&format!("{p}mlp.Wo.weight"), &[D, ENC_MLP_HIDDEN])?,
-            global: i.is_multiple_of(3),
+            wqkv: get(&format!("{p}attn.Wqkv.weight"), &[3 * d, d])?,
+            wo: get(&format!("{p}attn.Wo.weight"), &[d, d])?,
+            mlp_norm: get(&format!("{p}mlp_norm.weight"), &[d])?,
+            wi: get(&format!("{p}mlp.Wi.weight"), &[2 * cfg.intermediate, d])?,
+            wo_mlp: get(&format!("{p}mlp.Wo.weight"), &[d, cfg.intermediate])?,
+            global: cfg.global[i],
         })
     };
 
     let head_layer = |j: usize| -> color_eyre::Result<HeadLayer> {
         let p = format!("head.layers.{j}.");
         Ok(HeadLayer {
-            in_proj_w: get(&format!("{p}self_attn.in_proj_weight"), &[3 * D, D])?,
-            in_proj_b: get(&format!("{p}self_attn.in_proj_bias"), &[3 * D])?,
-            out_proj_w: get(&format!("{p}self_attn.out_proj.weight"), &[D, D])?,
-            out_proj_b: get(&format!("{p}self_attn.out_proj.bias"), &[D])?,
-            linear1_w: get(&format!("{p}linear1.weight"), &[HEAD_FF, D])?,
-            linear1_b: get(&format!("{p}linear1.bias"), &[HEAD_FF])?,
-            linear2_w: get(&format!("{p}linear2.weight"), &[D, HEAD_FF])?,
-            linear2_b: get(&format!("{p}linear2.bias"), &[D])?,
-            norm1_w: get(&format!("{p}norm1.weight"), &[D])?,
-            norm1_b: get(&format!("{p}norm1.bias"), &[D])?,
-            norm2_w: get(&format!("{p}norm2.weight"), &[D])?,
-            norm2_b: get(&format!("{p}norm2.bias"), &[D])?,
+            in_proj_w: get(&format!("{p}self_attn.in_proj_weight"), &[3 * d, d])?,
+            in_proj_b: get(&format!("{p}self_attn.in_proj_bias"), &[3 * d])?,
+            out_proj_w: get(&format!("{p}self_attn.out_proj.weight"), &[d, d])?,
+            out_proj_b: get(&format!("{p}self_attn.out_proj.bias"), &[d])?,
+            linear1_w: get(&format!("{p}linear1.weight"), &[cfg.head_ff, d])?,
+            linear1_b: get(&format!("{p}linear1.bias"), &[cfg.head_ff])?,
+            linear2_w: get(&format!("{p}linear2.weight"), &[d, cfg.head_ff])?,
+            linear2_b: get(&format!("{p}linear2.bias"), &[d])?,
+            norm1_w: get(&format!("{p}norm1.weight"), &[d])?,
+            norm1_b: get(&format!("{p}norm1.bias"), &[d])?,
+            norm2_w: get(&format!("{p}norm2.weight"), &[d])?,
+            norm2_b: get(&format!("{p}norm2.bias"), &[d])?,
         })
     };
 
     let weights = Weights {
         encoder: Encoder {
-            tok_embeddings: get("encoder.embeddings.tok_embeddings.weight", &[VOCAB, D])?,
-            emb_norm: get("encoder.embeddings.norm.weight", &[D])?,
-            layers: (0..N_ENC)
+            tok_embeddings: get("encoder.embeddings.tok_embeddings.weight", &[cfg.vocab, d])?,
+            emb_norm: get("encoder.embeddings.norm.weight", &[d])?,
+            layers: (0..cfg.n_layers)
                 .map(enc_layer)
-                .collect::<color_eyre::Result<Vec<_>>>()?
-                .try_into()
-                .unwrap(),
-            final_norm: get("encoder.final_norm.weight", &[D])?,
+                .collect::<color_eyre::Result<_>>()?,
+            final_norm: get("encoder.final_norm.weight", &[d])?,
         },
-        type_emb: get("type_emb.weight", &[N_TYPES, D])?,
-        head: (0..N_HEAD)
+        type_emb: get("type_emb.weight", &[N_QTYPES, d])?,
+        head: (0..cfg.head_layers)
             .map(head_layer)
-            .collect::<color_eyre::Result<Vec<_>>>()?
-            .try_into()
-            .unwrap(),
+            .collect::<color_eyre::Result<_>>()?,
         scorer: Scorer {
-            norm_w: get("scorer.0.weight", &[D])?,
-            norm_b: get("scorer.0.bias", &[D])?,
-            lin1_w: get("scorer.1.weight", &[D, D])?,
-            lin1_b: get("scorer.1.bias", &[D])?,
-            lin2_w: get("scorer.3.weight", &[1, D])?,
+            norm_w: get("scorer.0.weight", &[d])?,
+            norm_b: get("scorer.0.bias", &[d])?,
+            lin1_w: get("scorer.1.weight", &[d, d])?,
+            lin1_b: get("scorer.1.bias", &[d])?,
+            lin2_w: get("scorer.3.weight", &[1, d])?,
             lin2_b: get("scorer.3.bias", &[1])?,
         },
     };
 
     // Every used tensor was found by name above, so matching counts means there are no unknown keys.
+    // `act_head.*` and `temperature` are present in the file but unused.
+    let n_used = 3 + 1 + 6 + cfg.n_layers * 6 - 1 + cfg.head_layers * 12;
     let used = header
         .tensors
         .keys()
         .filter(|k| !k.starts_with("act_head.") && **k != "temperature")
         .count();
     ensure!(
-        used == N_USED,
+        used == n_used,
         "header has {} unexpected tensors",
-        used - N_USED
+        used - n_used
     );
 
     Ok(weights)

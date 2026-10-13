@@ -37,6 +37,8 @@ pub struct Tokenizer {
     added: Vec<Vec<AddedToken>>,
     space_id: u32,
     pub special: SpecialIds,
+    /// Number of ids (max vocab id + 1).
+    pub vocab_size: usize,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +109,7 @@ impl Tokenizer {
                 }
             })
             .collect();
+        let vocab_size = model.vocab.values().max().map_or(0, |&m| m as usize + 1);
         let space_id = *char_ids
             .get(&SPACE)
             .ok_or_else(|| eyre!("`{SPACE}` missing from vocab"))?;
@@ -150,6 +153,7 @@ impl Tokenizer {
             merges,
             added,
             space_id,
+            vocab_size,
             special,
         })
     }
