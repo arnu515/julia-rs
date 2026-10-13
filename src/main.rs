@@ -9,7 +9,7 @@ fn main() -> color_eyre::Result<()> {
         panic!("AVX-VNNI is required to run this program");
     }
 
-    let model = load_model(ModelConfig {
+    let model = load_model(ModelPaths {
         safetensors_path: "/path/to/Julia-1/model.safetensors",
         encoder_config_json_path: "/path/to/Julia-1/encoder/config.json",
         julia_config_json_path: "/path/to/Julia-1/julia_config.json",

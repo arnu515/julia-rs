@@ -9,6 +9,7 @@ use color_eyre::eyre::{bail, ensure};
 use memmap2::Mmap;
 
 pub mod config;
+pub mod matmul;
 pub mod safetensors;
 pub mod tokenizer;
 
@@ -54,7 +55,9 @@ impl Model {
 fn layernorm(row: &mut [f32], norms: &[f32], biases: Option<&[f32]>, eps: f32) {
     assert!(row.len().is_multiple_of(8) && norms.len() == row.len());
     let n = row.len() as f32;
-    let (chunks, _) = row.as_chunks::<8>();
+    let (chunks, []) = row.as_chunks::<8>() else {
+        unreachable!()
+    };
     let mean = chunks
         .iter()
         .map(|&c| f32x8::from_array(c))
@@ -71,10 +74,16 @@ fn layernorm(row: &mut [f32], norms: &[f32], biases: Option<&[f32]>, eps: f32) {
         f32x8::splat(1.0 / (acc.reduce_sum() / n + eps).sqrt())
     };
 
-    let (row, _) = row.as_chunks_mut::<8>();
-    let (norms, _) = norms.as_chunks::<8>();
+    let (row, []) = row.as_chunks_mut::<8>() else {
+        unreachable!()
+    };
+    let (norms, []) = norms.as_chunks::<8>() else {
+        unreachable!()
+    };
     if let Some(biases) = biases {
-        let (biases, _) = biases.as_chunks::<8>();
+        let (biases, []) = biases.as_chunks::<8>() else {
+            unreachable!()
+        };
         for ((row, &norm), &bias) in row.iter_mut().zip(norms).zip(biases) {
             *row = ((f32x8::from_array(*row) - mean) * factor)
                 .mul_add(f32x8::from_array(norm), f32x8::from_array(bias))
