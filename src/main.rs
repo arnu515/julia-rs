@@ -17,12 +17,15 @@ use julia_rs::{
     ModelPaths,
     head::Answer,
     load_model,
+    matmul::Precision,
     sequence::{DEFAULT_HEAD_LENGTH, Request},
 };
 use serde_json::json;
 
 const USAGE: &str = "usage: julia-rs <checkpoint dir> [--max-length N] [--head-length N] \
-[--threads N] < requests.jsonl
+[--threads N] [--precision f32|i16] < requests.jsonl
+  --precision i16 runs the linear layers in 13-bit integers: faster, with logits that differ
+  slightly from the f32 reference (default f32).
   --threads defaults to RAYON_NUM_THREADS, else every logical CPU. One per physical performance
   core is usually fastest: hyperthreads and slow cores mostly contend for cache and memory.";
 
@@ -36,16 +39,15 @@ fn main() -> color_eyre::Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().ok_or_else(|| eyre!(USAGE))?);
     let (mut max_length, mut head_length, mut threads) = (None, DEFAULT_HEAD_LENGTH, 0);
+    let mut precision = Precision::F32;
     while let Some(flag) = args.next() {
-        let value: usize = args
-            .next()
-            .ok_or_else(|| eyre!(USAGE))?
-            .parse()
-            .wrap_err(USAGE)?;
+        let value = args.next().ok_or_else(|| eyre!(USAGE))?;
+        let number = || value.parse::<usize>().wrap_err(USAGE);
         match flag.as_str() {
-            "--max-length" => max_length = Some(value),
-            "--head-length" => head_length = value,
-            "--threads" => threads = value,
+            "--max-length" => max_length = Some(number()?),
+            "--head-length" => head_length = number()?,
+            "--threads" => threads = number()?,
+            "--precision" => precision = value.parse().wrap_err(USAGE)?,
             _ => bail!(USAGE),
         }
     }
@@ -56,13 +58,16 @@ fn main() -> color_eyre::Result<()> {
         .build()?;
 
     let path = |p: &str| dir.join(p);
-    let model = load_model(ModelPaths {
-        safetensors_path: &path("model.safetensors"),
-        encoder_config_json_path: &path("encoder/config.json"),
-        julia_config_json_path: &path("julia_config.json"),
-        tokenizer_json_path: &path("tokenizer/tokenizer.json"),
-        tokenizer_config_json_path: &path("tokenizer/tokenizer_config.json"),
-    })?;
+    let model = load_model(
+        ModelPaths {
+            safetensors_path: &path("model.safetensors"),
+            encoder_config_json_path: &path("encoder/config.json"),
+            julia_config_json_path: &path("julia_config.json"),
+            tokenizer_json_path: &path("tokenizer/tokenizer.json"),
+            tokenizer_config_json_path: &path("tokenizer/tokenizer_config.json"),
+        },
+        precision,
+    )?;
     let max_length = max_length.unwrap_or(model.config.max_positions);
 
     let run = |i: usize, line: &str| -> color_eyre::Result<String> {

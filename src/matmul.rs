@@ -1,6 +1,21 @@
-//! y = x·Wᵀ + b with W packed once at load time for a 6×16 register-tile kernel.
+//! y = x·Wᵀ + b with W packed once at load time for a 6×16 register-tile kernel, in f32 or in
+//! 13-bit integers (AVX-VNNI).
 
-use std::simd::{StdFloat, f32x8};
+use std::{
+    arch::{
+        asm,
+        x86_64::{__m256i, _mm256_cvtps_epi32, _mm256_packs_epi32, _mm256_permute4x64_epi64},
+    },
+    simd::{
+        StdFloat,
+        cmp::SimdOrd,
+        f32x8, i16x16, i32x8,
+        num::{SimdFloat, SimdInt, SimdUint},
+    },
+    str::FromStr,
+};
+
+use color_eyre::eyre::bail;
 
 use rayon::prelude::*;
 
@@ -19,37 +34,150 @@ const CB: usize = 6 * NR;
 /// over 1152 inputs loses ~4x the accuracy of PyTorch; blocks of 64 match it for ~2% speed.
 const KC: usize = 64;
 
-/// A weight matrix `[out, inp]` repacked as panels of 16 outputs, each `[inp][16]`, so the kernel
-/// reads 16 outputs' weights for one input index as two contiguous vectors. The last panel is
-/// zero-padded.
+/// Largest integer in [`Precision::I16`]: 13-bit values. 12 bits changed logits by 0.09 on average
+/// over 100 benchmark questions, 13 bits by 0.05, and 14 would need an f32 flush every 32 inputs.
+const L16: f32 = 4095.0;
+/// Input pairs summed in i32 before converting to f32: |each product| <= L16², and 128 of them
+/// stay below 2³¹, so the integer sums can't overflow.
+const KP16: usize = 64;
+const _: () = assert!(2 * KP16 as u64 * (L16 as u64).pow(2) < 1 << 31);
+
+/// Number format of the packed weights and of the activations multiplied with them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Precision {
+    /// Exact f32 (the reference).
+    #[default]
+    F32,
+    /// Weights with one scale per output, activations with one per token, both as 13-bit integers
+    /// in i16. About bf16's accuracy and 2× the multiply-adds per instruction (`vpdpwssd`).
+    I16,
+}
+
+impl FromStr for Precision {
+    type Err = color_eyre::Report;
+    fn from_str(s: &str) -> color_eyre::Result<Self> {
+        Ok(match s {
+            "f32" => Self::F32,
+            "i16" => Self::I16,
+            _ => bail!("unknown precision {s:?} (f32, i16)"),
+        })
+    }
+}
+
+/// A weight matrix `[out, inp]` repacked as panels of 16 outputs, so the kernel reads 16
+/// outputs' weights for one input index (f32) or input pair (i16) as two contiguous vectors. The
+/// last panel is zero-padded.
 pub struct Packed {
-    panels: Vec<[f32; NR]>,
+    panels: Panels,
     inp: usize,
     out: usize,
 }
 
+enum Panels {
+    /// `[inp][16]` per panel.
+    F32(Vec<[f32; NR]>),
+    /// `[inp / 2][16][2]` per panel (`vpdpwssd` sums adjacent pairs), inputs padded to even, and
+    /// one scale per output (padded with zeros).
+    I16 {
+        panels: Vec<[i16; 2 * NR]>,
+        scale: Vec<f32>,
+    },
+}
+
 impl Packed {
     /// Packs `w` (`[out, inp]`, row-major as in PyTorch), in parallel over panels.
-    pub fn new(w: &[f32], inp: usize) -> Self {
+    pub fn new(w: &[f32], inp: usize, precision: Precision) -> Self {
         let out = w.len() / inp;
         assert!(
             inp > 0 && w.len() == out * inp,
             "Packed: {} weights are not [_, {inp}]",
             w.len()
         );
-        let mut panels = vec![[0f32; NR]; out.div_ceil(NR) * inp];
-        panels
-            .par_chunks_exact_mut(inp)
-            .enumerate()
-            .for_each(|(p, panel)| {
-                for (c, row) in w[p * NR * inp..].chunks_exact(inp).take(NR).enumerate() {
-                    for (dst, &v) in panel.iter_mut().zip(row) {
-                        dst[c] = v;
+        let rows = |p: usize| w[p * NR * inp..].chunks_exact(inp).take(NR).enumerate();
+        let panels = match precision {
+            Precision::F32 => {
+                let mut panels = vec![[0f32; NR]; out.div_ceil(NR) * inp];
+                (panels.par_chunks_exact_mut(inp).enumerate()).for_each(|(p, panel)| {
+                    for (c, row) in rows(p) {
+                        for (dst, &v) in panel.iter_mut().zip(row) {
+                            dst[c] = v;
+                        }
                     }
-                }
-            });
+                });
+                Panels::F32(panels)
+            }
+            Precision::I16 => {
+                let kp = inp.div_ceil(2);
+                let mut panels = vec![[0i16; 2 * NR]; out.div_ceil(NR) * kp];
+                let mut scale = vec![0f32; out.div_ceil(NR) * NR];
+                let chunks = panels
+                    .par_chunks_exact_mut(kp)
+                    .zip(scale.par_chunks_mut(NR));
+                chunks.enumerate().for_each(|(p, (panel, scale))| {
+                    for (c, row) in rows(p) {
+                        let (s, inv) = scales(row);
+                        scale[c] = s;
+                        for (k, &v) in row.iter().enumerate() {
+                            panel[k / 2][2 * c + k % 2] = (v * inv).round_ties_even() as i16;
+                        }
+                    }
+                });
+                Panels::I16 { panels, scale }
+            }
+        };
         Self { panels, inp, out }
     }
+}
+
+/// Largest |x|, vectorised.
+fn max_abs(x: &[f32]) -> f32 {
+    // As integers, |x| bit patterns order like the floats, and the max is one vpmaxsd (f32 max
+    // compiles to a NaN-handling compare + blend).
+    let (v, tail) = x.as_chunks::<8>();
+    let m = (v.iter()).fold(i32x8::splat(0), |m, &v| {
+        m.simd_max(f32x8::from_array(v).abs().to_bits().cast())
+    });
+    let m = f32::from_bits(m.reduce_max() as u32);
+    tail.iter().fold(m, |m, v| m.max(v.abs()))
+}
+
+/// Symmetric 13-bit scale of a row and its inverse: x ≈ scale · round(x · inverse).
+fn scales(x: &[f32]) -> (f32, f32) {
+    let m = max_abs(x);
+    if m > 0.0 {
+        (m / L16, L16 / m)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+/// The rows of `x` (`[n, inp]`) as 13-bit integers, each adjacent pair packed into one i32 (the
+/// operand `vpdpwssd` broadcasts; odd `inp` is zero-padded), with one scale per row.
+fn quantize_i16(x: &[f32], inp: usize) -> (Vec<i32>, Vec<f32>) {
+    let (n, kp) = (x.len() / inp, inp.div_ceil(2));
+    let (mut q, mut s) = (vec![0i32; n * kp], vec![0f32; n]);
+    let rows = q
+        .par_chunks_exact_mut(kp)
+        .zip(&mut s)
+        .zip(x.par_chunks_exact(inp));
+    rows.with_min_len(16).for_each(|((q, s), x)| {
+        let inv;
+        (*s, inv) = scales(x);
+        // SAFETY: an i32 slice reinterpreted as twice as many i16s (x86 is little-endian, so
+        // input 2k is the low half of pair k).
+        let q = unsafe { std::slice::from_raw_parts_mut(q.as_mut_ptr().cast::<i16>(), 2 * kp) };
+        let (xv, tail) = x.as_chunks::<16>();
+        let (qv, qtail) = q.as_chunks_mut::<16>();
+        let inv8 = f32x8::splat(inv);
+        for (q, x) in qv.iter_mut().zip(xv) {
+            let (a, b) = x.split_at(8);
+            *q = to_i16(f32x8::from_slice(a) * inv8, f32x8::from_slice(b) * inv8).to_array();
+        }
+        for (q, &x) in qtail.iter_mut().zip(tail) {
+            *q = (x * inv).round_ties_even() as i16;
+        }
+    });
+    (q, s)
 }
 
 /// `y`'s base pointer, shared by the tasks of one `linear` call. Each task writes only its own
@@ -79,37 +207,53 @@ pub fn linear(x: &[f32], w: &Packed, b: Option<&[f32]>, y: &mut [f32]) {
         x.len(),
         y.len()
     );
-    let nc = out.div_ceil(CB);
     let y = Out(y.as_mut_ptr());
+    match &w.panels {
+        Panels::F32(panels) => tiles(n, out, |t, m, j| {
+            let panel = &panels[j / NR * inp..][..inp];
+            match m {
+                MR => store(tile_f32::<MR>(x, panel, t), out, b, y, t, j),
+                _ => store(tile_f32::<1>(x, panel, t), out, b, y, t, j),
+            }
+        }),
+        Panels::I16 { panels, scale } => {
+            let (xq, sx) = quantize_i16(x, inp);
+            let kp = inp.div_ceil(2);
+            tiles(n, out, |t, m, j| {
+                let (panel, sw) = (&panels[j / NR * kp..][..kp], &scale[j..][..NR]);
+                match m {
+                    MR => store(tile_i16::<MR>(&xq, panel, &sx, sw, t), out, b, y, t, j),
+                    _ => store(tile_i16::<1>(&xq, panel, &sx, sw, t), out, b, y, t, j),
+                }
+            })
+        }
+    }
+}
+
+/// Runs `tile(t, m, j)` for every `m`-token (`MR` or 1) × 16-output tile of an `[n, out]` result,
+/// in parallel over blocks of tokens × outputs.
+fn tiles(n: usize, out: usize, tile: impl Fn(usize, usize, usize) + Sync) {
+    let nc = out.div_ceil(CB);
     (0..n.div_ceil(TB) * nc).into_par_iter().for_each(|task| {
         let (t0, j0) = (task / nc * TB, task % nc * CB);
         let (t1, j1) = ((t0 + TB).min(n), (j0 + CB).min(out));
         // Panel by panel, so each panel stays in L1 for all the block's tokens.
         for j in (j0..j1).step_by(NR) {
-            let panel = &w.panels[j / NR * inp..][..inp];
             let mut t = t0;
             while t + MR <= t1 {
-                tile::<MR>(x, panel, out, b, y, t, j);
+                tile(t, MR, j);
                 t += MR;
             }
             for t in t..t1 {
-                tile::<1>(x, panel, out, b, y, t, j);
+                tile(t, 1, j);
             }
         }
     });
 }
 
-/// Outputs `j..j + 16` (fewer in a padded last panel) for tokens `t..t + M`.
+/// x·Wᵀ for tokens `t..t + M` and one f32 panel's 16 outputs.
 #[inline(always)]
-fn tile<const M: usize>(
-    x: &[f32],
-    panel: &[[f32; NR]],
-    out: usize,
-    b: Option<&[f32]>,
-    y: Out,
-    t: usize,
-    j: usize,
-) {
+fn tile_f32<const M: usize>(x: &[f32], panel: &[[f32; NR]], t: usize) -> [[f32x8; 2]; M] {
     let inp = panel.len();
     let xr: [&[f32]; M] = std::array::from_fn(|r| &x[(t + r) * inp..][..inp]);
     let mut sum = [[f32x8::splat(0.0); 2]; M];
@@ -129,7 +273,88 @@ fn tile<const M: usize>(
             s[1] += a[1];
         }
     }
-    let acc = sum;
+    sum
+}
+
+/// [`tile_f32`] on 13-bit integers: `x` holds packed input pairs and `sx` the token scales, `sw`
+/// the panel's output scales.
+#[inline(always)]
+fn tile_i16<const M: usize>(
+    x: &[i32],
+    panel: &[[i16; 2 * NR]],
+    sx: &[f32],
+    sw: &[f32],
+    t: usize,
+) -> [[f32x8; 2]; M] {
+    let kp = panel.len();
+    let xr: [&[i32]; M] = std::array::from_fn(|r| &x[(t + r) * kp..][..kp]);
+    let mut sum = [[f32x8::splat(0.0); 2]; M];
+    for (kb, panel) in panel.chunks(KP16).enumerate() {
+        let xb: [&[i32]; M] = std::array::from_fn(|r| &xr[r][kb * KP16..][..panel.len()]);
+        let mut acc = [[__m256i::from(i32x8::splat(0)); 2]; M];
+        for (k, w) in panel.iter().enumerate() {
+            let w0 = __m256i::from(i16x16::from_slice(&w[..NR]));
+            let w1 = __m256i::from(i16x16::from_slice(&w[NR..]));
+            for r in 0..M {
+                let xv = __m256i::from(i32x8::splat(xb[r][k]));
+                acc[r][0] = dpwssd(acc[r][0], xv, w0);
+                acc[r][1] = dpwssd(acc[r][1], xv, w1);
+            }
+        }
+        for (s, a) in sum.iter_mut().zip(acc) {
+            s[0] += i32x8::from(a[0]).cast::<f32>();
+            s[1] += i32x8::from(a[1]).cast::<f32>();
+        }
+    }
+    let (s0, s1) = (f32x8::from_slice(&sw[..8]), f32x8::from_slice(&sw[8..]));
+    for (r, s) in sum.iter_mut().enumerate() {
+        let st = f32x8::splat(sx[t + r]);
+        s[0] *= st * s0;
+        s[1] *= st * s1;
+    }
+    sum
+}
+
+/// a and b rounded to the nearest integers (ties to even), in order. Values must fit i16.
+#[inline(always)]
+fn to_i16(a: f32x8, b: f32x8) -> i16x16 {
+    // SAFETY: the crate is built with AVX2 (.cargo/config.toml), and `main` checks for it.
+    unsafe {
+        let (a, b) = (_mm256_cvtps_epi32(a.into()), _mm256_cvtps_epi32(b.into()));
+        // packs interleaves 128-bit halves (a0-3 b0-3 a4-7 b4-7); the permute restores order.
+        _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(a, b)).into()
+    }
+}
+
+/// acc + Σ adjacent i16 pairs of a·b, per i32 lane.
+#[inline(always)]
+fn dpwssd(mut acc: __m256i, a: __m256i, b: __m256i) -> __m256i {
+    // Inline asm, since LLVM splits `_mm256_dpwssd_avx_epi32` into vpmaddwd + vpaddd, two µops
+    // instead of one, which halved the kernel's speed.
+    // SAFETY: the crate is built with AVX-VNNI (.cargo/config.toml), and `main` checks for it.
+    unsafe {
+        asm!(
+            "{{vex}} vpdpwssd {acc}, {a}, {b}",
+            acc = inout(ymm_reg) acc,
+            a = in(ymm_reg) a,
+            b = in(ymm_reg) b,
+            options(pure, nomem, nostack),
+        );
+    }
+    acc
+}
+
+/// Writes a tile's sums plus bias to outputs `j..j + 16` (fewer in a padded last panel) of
+/// tokens `t..t + M`.
+#[inline(always)]
+fn store<const M: usize>(
+    acc: [[f32x8; 2]; M],
+    out: usize,
+    b: Option<&[f32]>,
+    y: Out,
+    t: usize,
+    j: usize,
+) {
     let cols = (out - j).min(NR);
     for (r, acc) in acc.iter().enumerate() {
         // SAFETY: token t + r and outputs j..j + cols are inside this task's block.
@@ -152,17 +377,33 @@ fn tile<const M: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Packed, linear};
+    use super::{L16, Packed, Precision, linear};
 
-    fn naive(x: &[f32], w: &[f32], b: Option<&[f32]>, inp: usize) -> Vec<f32> {
+    /// The exact product, and how far `precision` may stray from it: rounding each integer to the
+    /// nearest step moves x by ≤ sx/2 and w by ≤ sw/2, so a product by ≤ |x|·sw/2 + |w|·sx/2 +
+    /// sx·sw/4.
+    fn naive(
+        x: &[f32],
+        w: &[f32],
+        b: Option<&[f32]>,
+        inp: usize,
+        precision: Precision,
+    ) -> Vec<(f32, f32)> {
+        let step = |r: &[f32]| r.iter().fold(0f32, |m, v| m.max(v.abs())) as f64 / L16 as f64;
         let (n, out) = (x.len() / inp, w.len() / inp);
-        let mut y = vec![0.0; n * out];
-        for i in 0..n {
-            for o in 0..out {
-                let dot: f64 = (0..inp)
-                    .map(|k| x[i * inp + k] as f64 * w[o * inp + k] as f64)
-                    .sum();
-                y[i * out + o] = dot as f32 + b.map_or(0.0, |b| b[o]);
+        let mut y = Vec::with_capacity(n * out);
+        for xr in x.chunks_exact(inp) {
+            for (o, wr) in w.chunks_exact(inp).enumerate() {
+                let (sx, sw) = (step(xr), step(wr));
+                let (mut dot, mut tol) = (0f64, 1e-5);
+                for (&a, &c) in xr.iter().zip(wr) {
+                    let (a, c) = (a as f64, c as f64);
+                    dot += a * c;
+                    if precision == Precision::I16 {
+                        tol += a.abs() * sw / 2.0 + c.abs() * sx / 2.0 + sx * sw / 4.0;
+                    }
+                }
+                y.push((dot as f32 + b.map_or(0.0, |b| b[o]), tol as f32));
             }
         }
         y
@@ -180,8 +421,8 @@ mod tests {
                 .collect()
         };
         // Model shapes; out == 1 (scorer); 1 token; counts that leave partial 6-token tiles,
-        // padded 16-output panels and partial task blocks; an odd inp.
-        for (n, inp, out) in [
+        // padded 16-output panels and partial task blocks; odd inp (a padded i16 pair).
+        let mut cases: Vec<_> = [
             (37, 384, 1152),
             (40, 1152, 384),
             (3, 384, 1),
@@ -190,31 +431,44 @@ mod tests {
             (150, 384, 2304),
             (130, 64, 200),
             (7, 13, 21),
-        ] {
-            let (x, w, b) = (rnd(n * inp), rnd(out * inp), rnd(out));
-            let packed = Packed::new(&w, inp);
-            // Task blocks are fixed, but run the tests on several pool sizes anyway.
-            for (threads, b) in [1, 3, 22]
-                .into_iter()
-                .flat_map(|t| [(t, None), (t, Some(&b[..]))])
-            {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .build()
-                    .unwrap();
-                let mut y = vec![0.0; n * out];
-                pool.install(|| linear(&x, &packed, b, &mut y));
-                let want = naive(&x, &w, b, inp);
-                let err = y
-                    .iter()
-                    .zip(&want)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0, f32::max);
-                assert!(
-                    err < 1e-5,
-                    "n={n} {inp}->{out} bias={} threads={threads}: max err {err}",
-                    b.is_some()
-                );
+        ]
+        .into_iter()
+        .map(|(n, inp, out)| (inp, rnd(n * inp), rnd(out * inp), rnd(out)))
+        .collect();
+        // Every integer at ±L16 and all products of one sign: the largest i32 sums possible.
+        cases.push((
+            1152,
+            vec![-1.0; 12 * 1152],
+            vec![1.0; 20 * 1152],
+            vec![0.0; 20],
+        ));
+        for (inp, x, w, b) in &cases {
+            for precision in [Precision::F32, Precision::I16] {
+                let packed = Packed::new(w, *inp, precision);
+                // Task blocks are fixed, but run the tests on several pool sizes anyway.
+                for (threads, b) in [1, 3, 22]
+                    .into_iter()
+                    .flat_map(|t| [(t, None), (t, Some(&b[..]))])
+                {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let mut y = vec![0.0; x.len() / inp * (w.len() / inp)];
+                    pool.install(|| linear(x, &packed, b, &mut y));
+                    for (i, (&got, (want, tol))) in
+                        y.iter().zip(naive(x, w, b, *inp, precision)).enumerate()
+                    {
+                        assert!(
+                            (got - want).abs() <= tol,
+                            "{precision:?} {}x{inp}->{} bias={} threads={threads}: y[{i}] = {got}, \
+                             want {want} ± {tol}",
+                            x.len() / inp,
+                            w.len() / inp,
+                            b.is_some(),
+                        );
+                    }
+                }
             }
         }
     }
@@ -222,6 +476,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "bad shapes")]
     fn short_output_panics() {
-        linear(&[0.0; 16], &Packed::new(&[0.0; 24], 8), None, &mut [0.0; 5]);
+        linear(
+            &[0.0; 16],
+            &Packed::new(&[0.0; 24], 8, Precision::F32),
+            None,
+            &mut [0.0; 5],
+        );
     }
 }

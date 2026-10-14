@@ -27,7 +27,7 @@ use tokenizer::Tokenizer;
 
 use crate::{
     attn::{Rope, Scratch, attention},
-    matmul::{Packed, linear},
+    matmul::{Packed, Precision, linear},
     mlp::geglu,
 };
 
@@ -67,9 +67,9 @@ pub struct PackedWeights {
 }
 
 impl PackedWeights {
-    fn new(w: &Weights, data: &[u8], cfg: &ModelConfig) -> Self {
+    fn new(w: &Weights, data: &[u8], cfg: &ModelConfig, precision: Precision) -> Self {
         let (d, inter, ff) = (cfg.hidden, cfg.intermediate, cfg.head_ff);
-        let p = |t: &safetensors::Tensor, inp: usize| Packed::new(t.as_f32(data), inp);
+        let p = |t: &safetensors::Tensor, inp: usize| Packed::new(t.as_f32(data), inp, precision);
         Self {
             encoder: (w.encoder.layers.iter())
                 .map(|l| EncoderLinears {
@@ -83,8 +83,8 @@ impl PackedWeights {
                 .map(|l| {
                     let (q, kv) = l.in_proj_w.as_f32(data).split_at(d * d);
                     HeadLinears {
-                        q: Packed::new(q, d),
-                        kv: Packed::new(kv, d),
+                        q: Packed::new(q, d, precision),
+                        kv: Packed::new(kv, d, precision),
                         out_proj: p(&l.out_proj_w, d),
                         linear1: p(&l.linear1_w, d),
                         linear2: p(&l.linear2_w, ff),
@@ -266,7 +266,8 @@ pub struct ModelPaths<'a> {
     pub tokenizer_config_json_path: &'a Path,
 }
 
-pub fn load_model(paths: ModelPaths<'_>) -> color_eyre::Result<Model> {
+/// Loads a checkpoint, packing its linear weights in `precision`.
+pub fn load_model(paths: ModelPaths<'_>, precision: Precision) -> color_eyre::Result<Model> {
     let config = ModelConfig::load(paths.encoder_config_json_path, paths.julia_config_json_path)?;
 
     let file = File::open(paths.safetensors_path)?;
@@ -281,7 +282,7 @@ pub fn load_model(paths: ModelPaths<'_>) -> color_eyre::Result<Model> {
         bail!("model.safetensors header length {len} exceeds file size");
     };
     let weights = safetensors::parse_header(header, map.len() - data_start, &config)?;
-    let packed = PackedWeights::new(&weights, &map[data_start..], &config);
+    let packed = PackedWeights::new(&weights, &map[data_start..], &config, precision);
     let tokenizer = Tokenizer::load(paths.tokenizer_json_path, paths.tokenizer_config_json_path)?;
     ensure!(
         tokenizer.vocab_size == config.vocab,
