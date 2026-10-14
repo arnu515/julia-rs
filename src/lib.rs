@@ -27,7 +27,7 @@ use tokenizer::Tokenizer;
 
 use crate::{
     attn::{Rope, Scratch, attention},
-    matmul::{Packed, Precision, linear},
+    matmul::{Packed, Precision, linear, linear_add},
     mlp::geglu,
 };
 
@@ -158,15 +158,13 @@ impl Model {
             };
             rope.apply(&mut qkv, d);
             attention(&qkv, n, d, window, &mut o, &mut s);
-            linear(&o, &p.wo, None, &mut h);
-            f32_vec_add(&mut x, &h);
+            linear_add(&o, &p.wo, None, &mut x);
 
             // MLP
             norm_rows(&x, Some(l.mlp_norm.as_f32(data)), None, eps, &mut h);
             linear(&h, &p.wi, None, &mut hh);
             geglu(&hh, inter, &mut m);
-            linear(&m, &p.wo_mlp, None, &mut h);
-            f32_vec_add(&mut x, &h);
+            linear_add(&m, &p.wo_mlp, None, &mut x);
 
             tap(&format!("layer{i:02}"), &x);
         }

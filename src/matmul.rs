@@ -269,11 +269,12 @@ fn quantize_u8(x: &[f32], inp: usize) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
     (q, s, z)
 }
 
-/// `y`'s base pointer, shared by the tasks of one `linear` call. Each task writes only its own
-/// (token block × output block) and those blocks partition `y`, so no element is written twice
-/// or read, and the `&mut y` borrow outlives the parallel loop.
+/// `y`'s base pointer, shared by the tasks of one `linear` call, and whether results are added
+/// to `y` rather than stored. Each task touches only its own (token block × output block) and
+/// those blocks partition `y`, so no element is used twice, and the `&mut y` borrow outlives the
+/// parallel loop.
 #[derive(Clone, Copy)]
-struct Out(*mut f32);
+struct Out(*mut f32, bool);
 unsafe impl Send for Out {}
 unsafe impl Sync for Out {}
 
@@ -287,6 +288,15 @@ impl Out {
 
 /// y[n, out] = x[n, inp] · Wᵀ + b, in parallel over blocks of tokens × outputs.
 pub fn linear(x: &[f32], w: &Packed, b: Option<&[f32]>, y: &mut [f32]) {
+    linear_into(x, w, b, y, false);
+}
+
+/// y[n, out] += x[n, inp] · Wᵀ + b: a residual add fused into the matmul's stores.
+pub fn linear_add(x: &[f32], w: &Packed, b: Option<&[f32]>, y: &mut [f32]) {
+    linear_into(x, w, b, y, true);
+}
+
+fn linear_into(x: &[f32], w: &Packed, b: Option<&[f32]>, y: &mut [f32], add: bool) {
     let (inp, out) = (w.inp, w.out);
     let n = x.len() / inp;
     // A mismatched y would otherwise silently skip rows.
@@ -296,7 +306,7 @@ pub fn linear(x: &[f32], w: &Packed, b: Option<&[f32]>, y: &mut [f32]) {
         x.len(),
         y.len()
     );
-    let y = Out(y.as_mut_ptr());
+    let y = Out(y.as_mut_ptr(), add);
     match &w.panels {
         Panels::F32(panels) => tiles(n, out, |t, m, j| {
             let panel = &panels[j / NR * inp..][..inp];
@@ -508,8 +518,8 @@ fn dpbusd(mut acc: __m256i, a: __m256i, b: __m256i) -> __m256i {
     acc
 }
 
-/// Writes a tile's sums plus bias to outputs `j..j + 16` (fewer in a padded last panel) of
-/// tokens `t..t + M`.
+/// Writes (or adds) a tile's sums plus bias to outputs `j..j + 16` (fewer in a padded last
+/// panel) of tokens `t..t + M`.
 #[inline(always)]
 fn store<const M: usize>(
     acc: [[f32x8; 2]; M],
@@ -528,12 +538,18 @@ fn store<const M: usize>(
             let (b0, b1) = b.map_or((zero, zero), |b| {
                 (f32x8::from_slice(&b[j..]), f32x8::from_slice(&b[j + 8..]))
             });
-            (acc[0] + b0).copy_to_slice(&mut yr[..8]);
-            (acc[1] + b1).copy_to_slice(&mut yr[8..]);
+            let (mut v0, mut v1) = (acc[0] + b0, acc[1] + b1);
+            if y.1 {
+                v0 += f32x8::from_slice(&yr[..8]);
+                v1 += f32x8::from_slice(&yr[8..]);
+            }
+            v0.copy_to_slice(&mut yr[..8]);
+            v1.copy_to_slice(&mut yr[8..]);
         } else {
             let v = [acc[0].to_array(), acc[1].to_array()].concat();
-            for (c, y) in yr.iter_mut().enumerate() {
-                *y = v[c] + b.map_or(0.0, |b| b[j + c]);
+            for (c, y0) in yr.iter_mut().enumerate() {
+                let v = v[c] + b.map_or(0.0, |b| b[j + c]);
+                *y0 = if y.1 { *y0 + v } else { v };
             }
         }
     }
@@ -708,6 +724,25 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn add_adds() {
+        let (n, inp, out) = (13, 40, 37); // a partial tile and a padded panel
+        let x: Vec<f32> = (0..n * inp).map(|i| (i % 7) as f32 - 3.0).collect();
+        let w: Vec<f32> = (0..out * inp).map(|i| (i % 5) as f32 * 0.25).collect();
+        let b: Vec<f32> = (0..out).map(|i| i as f32).collect();
+        let y0: Vec<f32> = (0..n * out).map(|i| (i % 11) as f32).collect();
+        for precision in [Precision::F32, Precision::I16, Precision::I8] {
+            let p = Packed::new(&w, inp, precision);
+            let mut want = vec![0.0; n * out];
+            linear(&x, &p, Some(&b), &mut want);
+            let mut y = y0.clone();
+            super::linear_add(&x, &p, Some(&b), &mut y);
+            for ((y, y0), want) in y.iter().zip(&y0).zip(&want) {
+                assert_eq!(*y, y0 + want, "{precision:?}");
             }
         }
     }

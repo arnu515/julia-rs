@@ -8,7 +8,7 @@ use crate::{
     HeadLinears, Model,
     attn::{Scratch, attention_q},
     f32_vec_add, layernorm,
-    matmul::linear,
+    matmul::{linear, linear_add},
     mlp::gelu_inplace,
     norm_rows,
     safetensors::HeadLayer,
@@ -105,8 +105,7 @@ impl Model {
             linear(&h, &p.q, Some(bq), &mut o);
             linear(&h, &p.kv, Some(bkv), &mut kv);
             attention_q(&o, d, &kv, 2 * d, n, d, None, &mut h, &mut s);
-            linear(&h, &p.out_proj, Some(l.out_proj_b.as_f32(data)), &mut o);
-            f32_vec_add(&mut x, &o);
+            linear_add(&h, &p.out_proj, Some(l.out_proj_b.as_f32(data)), &mut x);
             self.head_mlp(l, p, &mut x, &mut h, &mut f);
             tap(&format!("head{i}"), &x);
         }
@@ -127,9 +126,7 @@ impl Model {
         let a = &mut h[..k * d];
         attention_q(q, d, &kv, 2 * d, n, d, None, a, &mut s);
         let mut xs = gather(&x, markers, d);
-        let po = &mut o[..k * d];
-        linear(a, &p.out_proj, Some(l.out_proj_b.as_f32(data)), po);
-        f32_vec_add(&mut xs, po);
+        linear_add(a, &p.out_proj, Some(l.out_proj_b.as_f32(data)), &mut xs);
         self.head_mlp(l, p, &mut xs, &mut h[..k * d], &mut f[..k * ff]);
         tap(&format!("head{}", dense.len()), &xs);
 
@@ -162,8 +159,7 @@ impl Model {
                 }
             }
         });
-        linear(f, &p.linear2, Some(l.linear2_b.as_f32(data)), h);
-        f32_vec_add(x, h);
+        linear_add(f, &p.linear2, Some(l.linear2_b.as_f32(data)), x);
     }
 
     /// The scorer on marker rows `z` (`[k, d]`): LayerNorm, Linear, GELU, Linear -> `k` logits.
