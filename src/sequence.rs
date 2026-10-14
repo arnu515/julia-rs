@@ -255,7 +255,7 @@ impl Model {
             self.config.max_positions
         );
         let seq = sequence(&self.tokenizer, req, max_length, head_length)?;
-        let logits = self.forward(&seq.ids, seq.qtype, &seq.markers, |_, _| {});
+        let logits = self.forward(&seq.ids, seq.qtype, &seq.markers);
         ensure!(
             logits.iter().all(|z| z.is_finite()),
             "inference returned nonfinite logits"

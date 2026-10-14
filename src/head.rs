@@ -51,28 +51,16 @@ pub enum Answer {
 }
 
 impl Model {
-    /// Encoder then head: one logit per marker position. `tap` sees every stage (see `encode`).
-    pub fn forward(
-        &self,
-        ids: &[u32],
-        qtype: QType,
-        markers: &[usize],
-        mut tap: impl FnMut(&str, &[f32]),
-    ) -> Vec<f32> {
-        let x = self.encode(ids, &mut tap);
-        self.head(x, qtype, markers, tap)
+    /// Encoder then head: one logit per marker position.
+    pub fn forward(&self, ids: &[u32], qtype: QType, markers: &[usize]) -> Vec<f32> {
+        let x = self.encode(ids);
+        self.head(x, qtype, markers)
     }
 
     /// The head on the encoder output `x` (`[n, d]`): one logit per marker position. Only marker
     /// rows are read at the end, so the last layer computes just those (Julia's exact
-    /// `_selected_head`); its tap gets the `[markers.len(), d]` marker rows.
-    pub fn head(
-        &self,
-        mut x: Vec<f32>,
-        qtype: QType,
-        markers: &[usize],
-        mut tap: impl FnMut(&str, &[f32]),
-    ) -> Vec<f32> {
+    /// `_selected_head`).
+    pub fn head(&self, mut x: Vec<f32>, qtype: QType, markers: &[usize]) -> Vec<f32> {
         let (data, d, ff) = (self.data(), self.config.hidden, self.config.head_ff);
         let (n, k) = (x.len() / d, markers.len());
         assert!(
@@ -93,7 +81,7 @@ impl Model {
         let mut f = vec![0f32; n * ff];
         let mut s = Scratch::default();
         let packed = &self.packed.head;
-        for (i, (l, p)) in dense.iter().zip(packed).enumerate() {
+        for (l, p) in dense.iter().zip(packed) {
             norm_rows(
                 &x,
                 Some(l.norm1_w.as_f32(data)),
@@ -107,7 +95,6 @@ impl Model {
             attention_q(&o, d, &kv, 2 * d, n, d, None, &mut h, &mut s);
             linear_add(&h, &p.out_proj, Some(l.out_proj_b.as_f32(data)), &mut x);
             self.head_mlp(l, p, &mut x, &mut h, &mut f);
-            tap(&format!("head{i}"), &x);
         }
 
         // Last layer: K and V from every row, everything else for the marker rows only.
@@ -128,7 +115,6 @@ impl Model {
         let mut xs = gather(&x, markers, d);
         linear_add(a, &p.out_proj, Some(l.out_proj_b.as_f32(data)), &mut xs);
         self.head_mlp(l, p, &mut xs, &mut h[..k * d], &mut f[..k * ff]);
-        tap(&format!("head{}", dense.len()), &xs);
 
         self.score(xs)
     }

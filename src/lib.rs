@@ -149,7 +149,7 @@ impl Model {
         x
     }
 
-    pub fn encode(&self, tokens: &[u32], mut tap: impl FnMut(&str, &[f32])) -> Vec<f32> {
+    pub fn encode(&self, tokens: &[u32]) -> Vec<f32> {
         let (n, d, inter, eps) = (
             tokens.len(),
             self.config.hidden,
@@ -165,14 +165,7 @@ impl Model {
         let rope_l = Rope::new(self.config.rope_theta_local, n);
 
         let data = self.data();
-        for (i, (l, p)) in self
-            .weights
-            .encoder
-            .layers
-            .iter()
-            .zip(&self.packed.encoder)
-            .enumerate()
-        {
+        for (l, p) in self.weights.encoder.layers.iter().zip(&self.packed.encoder) {
             // attention
             norm_rows(
                 &x,
@@ -196,13 +189,10 @@ impl Model {
             linear(&h, &p.wi, None, &mut hh);
             geglu(&hh, inter, &mut m);
             linear_add(&m, &p.wo_mlp, None, &mut x);
-
-            tap(&format!("layer{i:02}"), &x);
         }
         {
             let norms = self.weights.encoder.final_norm.as_f32(data);
             norm_rows_inplace(&mut x, norms, None, eps);
-            tap("final_norm", &x);
         }
 
         x
