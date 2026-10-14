@@ -93,7 +93,9 @@ mod tests {
         let mut y = vec![0.0; n * out];
         for i in 0..n {
             for o in 0..out {
-                let dot: f64 = (0..inp).map(|k| x[i * inp + k] as f64 * w[o * inp + k] as f64).sum();
+                let dot: f64 = (0..inp)
+                    .map(|k| x[i * inp + k] as f64 * w[o * inp + k] as f64)
+                    .sum();
                 y[i * out + o] = dot as f32 + b.map_or(0.0, |b| b[o]);
             }
         }
@@ -112,14 +114,28 @@ mod tests {
                 .collect()
         };
         // Covers the 4-row main part + tail, out % 3 == 0 and out == 1 (scorer), 1 token.
-        for (n, inp, out) in [(37, 384, 1152), (40, 1152, 384), (3, 384, 1), (1, 16, 3), (4, 8, 2)] {
+        for (n, inp, out) in [
+            (37, 384, 1152),
+            (40, 1152, 384),
+            (3, 384, 1),
+            (1, 16, 3),
+            (4, 8, 2),
+        ] {
             let (x, w, b) = (rnd(n * inp), rnd(out * inp), rnd(out));
             for b in [None, Some(&b[..])] {
                 let mut y = vec![0.0; n * out];
                 linear(&x, &w, b, inp, &mut y);
                 let want = naive(&x, &w, b, inp);
-                let err = y.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-                assert!(err < 1e-5, "n={n} {inp}->{out} bias={}: max err {err}", b.is_some());
+                let err = y
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(
+                    err < 1e-5,
+                    "n={n} {inp}->{out} bias={}: max err {err}",
+                    b.is_some()
+                );
             }
         }
     }

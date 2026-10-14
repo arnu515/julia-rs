@@ -12,6 +12,7 @@ use memmap2::Mmap;
 pub mod attn;
 pub mod avx2;
 pub mod config;
+pub mod head;
 pub mod matmul;
 pub mod mlp;
 pub mod safetensors;
@@ -118,14 +119,20 @@ impl Model {
     }
 }
 
-fn f32_vec_add(a: &mut [f32], b: &[f32]) {
+pub(crate) fn f32_vec_add(a: &mut [f32], b: &[f32]) {
     assert!(a.len() == b.len());
     for (a, &b) in a.iter_mut().zip(b) {
         *a += b;
     }
 }
 
-fn norm_rows(x: &[f32], norms: Option<&[f32]>, biases: Option<&[f32]>, eps: f32, out: &mut [f32]) {
+pub(crate) fn norm_rows(
+    x: &[f32],
+    norms: Option<&[f32]>,
+    biases: Option<&[f32]>,
+    eps: f32,
+    out: &mut [f32],
+) {
     out.copy_from_slice(x);
     if let Some(norms) = norms {
         assert!(out.len().is_multiple_of(norms.len()));
@@ -135,7 +142,7 @@ fn norm_rows(x: &[f32], norms: Option<&[f32]>, biases: Option<&[f32]>, eps: f32,
     }
 }
 
-fn layernorm(row: &mut [f32], norms: &[f32], biases: Option<&[f32]>, eps: f32) {
+pub(crate) fn layernorm(row: &mut [f32], norms: &[f32], biases: Option<&[f32]>, eps: f32) {
     assert!(row.len().is_multiple_of(8) && norms.len() == row.len());
     let n = row.len() as f32;
     let (chunks, []) = row.as_chunks::<8>() else {
