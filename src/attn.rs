@@ -8,9 +8,12 @@ use rayon::prelude::*;
 use crate::{avx2::exp2, config::HEAD_DIM as HD};
 
 const HALF: usize = HD / 2;
-const QB: usize = 4; // queries per tile
+/// Queries per tile: 6 × 2 accumulators + 2 loads + 1 broadcast = 15 of the 16 ymm registers,
+/// and 12 independent FMA chains, enough to keep both FMA units busy (4 queries, 8 chains, ran at
+/// ~45% of peak).
+const QB: usize = 6;
 const KB: usize = 16; // keys per tile (2 x f32x8)
-const QT: usize = 2 * QB; // queries per parallel task (all heads)
+const QT: usize = QB; // queries per parallel task (all heads)
 
 /// RoPE cos/sin for positions `0..n`, `[n][HD / 2]`. Rotate-half convention (dim `j` pairs with
 /// `j + HD/2`); angles in f32 like HF's `ModernBertRotaryEmbedding`.
@@ -67,9 +70,15 @@ impl Rope {
     }
 }
 
+/// Each head's keys and values, copied to be read sequentially: the fused `[q | k | v]` rows are
+/// 3d floats apart, and those strided loads cost ~20% of the attention time.
 #[derive(Default)]
 pub struct Scratch {
-    kt: Vec<f32>, // K^T per head: [heads][HD] rows, stride n + KB
+    /// K per head in blocks of 16 keys, each transposed: `[heads][n / KB][HD][KB]`, the last block
+    /// zero-padded, so SIMD lanes index keys.
+    k: Vec<[f32; KB]>,
+    /// V per head: `[heads][n][HD]`.
+    v: Vec<f32>,
 }
 
 /// In-place p = 2^(p - max(p)); returns the sum.
@@ -144,20 +153,27 @@ pub fn attention_q(
 
     // Fold 1/sqrt(HD) and log2(e) into Q so softmax is a bare exp2.
     let qscale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
-    let ks = n + KB; // padded so a 16-key tile never runs past the end
-    s.kt.clear();
-    s.kt.resize(d * ks, 0.0);
+    let (heads, nb) = (d / HD, n.div_ceil(KB));
+    s.k.clear();
+    s.v.clear();
+    s.k.resize(heads * nb * HD, [0.0; KB]);
+    s.v.resize(heads * n * HD, 0.0);
 
-    // 1. Transpose each head's K so SIMD lanes index keys.
-    s.kt.par_chunks_mut(HD * ks)
-        .enumerate()
-        .for_each(|(h, kt)| {
-            for j in 0..n {
-                for (t, &x) in kv[j * kvs + h * HD..][..HD].iter().enumerate() {
-                    kt[t * ks + j] = x;
-                }
+    // 1. Copy each head's keys (in transposed 16-key blocks) and values.
+    let blocks = s.k.par_chunks_mut(HD).enumerate();
+    blocks.with_min_len(4).for_each(|(hb, kb)| {
+        let (h, b) = (hb / nb, hb % nb);
+        for (k, j) in (b * KB..n.min(b * KB + KB)).enumerate() {
+            for (t, &x) in kv[j * kvs + h * HD..][..HD].iter().enumerate() {
+                kb[t][k] = x;
             }
-        });
+        }
+    });
+    let rows = s.v.par_chunks_exact_mut(HD).enumerate();
+    rows.with_min_len(64).for_each(|(hj, v)| {
+        let (h, j) = (hj / n, hj % n);
+        v.copy_from_slice(&kv[j * kvs + d + h * HD..][..HD]);
+    });
 
     let range = |i: usize| match window {
         Some(w) => (i.saturating_sub(w), (i + w + 1).min(n)),
@@ -166,16 +182,17 @@ pub fn attention_q(
 
     // 2-4 in parallel over blocks of QT queries, each doing every head, so a task's output rows
     // are its own contiguous chunk of `o`.
-    let kt = &s.kt;
-    o.par_chunks_mut(QT * d)
-        .enumerate()
-        .for_each_init(Vec::new, |scores, (b, o)| {
+    let (ks, vs) = (&s.k, &s.v);
+    o.par_chunks_mut(QT * d).enumerate().for_each_init(
+        Default::default,
+        |(scores, pt): &mut (Vec<f32>, Vec<f32>), (b, o)| {
             for h in 0..d / HD {
-                let (kt, vo) = (&kt[h * HD * ks..][..HD * ks], d + h * HD);
+                let (kh, vh) = (&ks[h * nb * HD..][..nb * HD], &vs[h * n * HD..][..n * HD]);
                 for l0 in (0..o.len() / d).step_by(QB) {
                     let i0 = b * QT + l0;
                     let tq = QB.min(nq - i0);
-                    let lo = range(i0).0;
+                    // From a 16-key block boundary; keys outside a query's window get p = 0.
+                    let lo = range(i0).0 / KB * KB;
                     let hi = range(i0 + tq - 1).1;
                     let span = hi - lo;
                     let ss = span.next_multiple_of(KB);
@@ -191,11 +208,10 @@ pub fn attention_q(
                         }
                     }
 
-                    // 2. S = Q K^T in 4x16 tiles: 8 independent FMA chains, no reductions.
+                    // 2. S = Q K^T in QB x 16 tiles: independent FMA chains, no reductions.
                     for jb in (0..span).step_by(KB) {
                         let mut acc = [[f32x8::splat(0.0); 2]; QB];
-                        for t in 0..HD {
-                            let k = &kt[t * ks + lo + jb..][..KB];
+                        for (t, k) in kh[(lo + jb) / KB * HD..][..HD].iter().enumerate() {
                             let k0 = f32x8::from_slice(&k[..8]);
                             let k1 = f32x8::from_slice(&k[8..]);
                             for r in 0..QB {
@@ -211,7 +227,8 @@ pub fn attention_q(
                     }
 
                     // 3. Softmax per query over its own window; zero the rest of the tile's span so
-                    //    all QB queries can share one pass over V.
+                    //    all QB queries can share one pass over V. Then transpose P to [key][QB],
+                    //    so step 4 finds one key's QB probabilities together.
                     let mut inv = [0f32; QB];
                     for (r, inv) in inv.iter_mut().enumerate().take(tq) {
                         let (a, b) = range(i0 + r);
@@ -220,15 +237,25 @@ pub fn attention_q(
                         p[..a - lo].fill(0.0);
                         p[b - lo..].fill(0.0);
                     }
+                    pt.clear();
+                    pt.resize(span * QB, 0.0);
+                    let (ptj, []) = pt.as_chunks_mut::<QB>() else {
+                        unreachable!()
+                    };
+                    for (r, p) in scores.chunks_exact(ss).enumerate().take(tq) {
+                        for (dst, &v) in ptj.iter_mut().zip(&p[..span]) {
+                            dst[r] = v;
+                        }
+                    }
 
                     // 4. O = P V, 16 output lanes at a time: each V load feeds QB queries.
                     for c in (0..HD).step_by(16) {
                         let mut acc = [[f32x8::splat(0.0); 2]; QB];
-                        for j in 0..span {
-                            let v = &kv[(lo + j) * kvs + vo + c..][..16];
+                        for (j, p) in ptj.iter().enumerate() {
+                            let v = &vh[(lo + j) * HD + c..][..16];
                             let (v0, v1) = (f32x8::from_slice(&v[..8]), f32x8::from_slice(&v[8..]));
                             for r in 0..QB {
-                                let p = f32x8::splat(scores[r * ss + j]);
+                                let p = f32x8::splat(p[r]);
                                 acc[r][0] = p.mul_add(v0, acc[r][0]);
                                 acc[r][1] = p.mul_add(v1, acc[r][1]);
                             }
@@ -242,7 +269,8 @@ pub fn attention_q(
                     }
                 }
             }
-        });
+        },
+    );
 }
 
 #[cfg(test)]
@@ -297,7 +325,7 @@ mod tests {
         };
         let d = 2 * HD;
         let mut scratch = Scratch::default();
-        // n not a multiple of the 4-query / 16-key tiles; windows narrower than n.
+        // n not a multiple of the query / 16-key tiles; windows narrower than n.
         for (n, window) in [
             (1, None),
             (37, None),
