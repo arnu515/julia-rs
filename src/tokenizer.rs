@@ -3,7 +3,7 @@
 //! added-token split -> `' '` to `'▁'` -> Metaspace (prepend `▁` to every segment, split before
 //! each `▁`) -> BPE over ranked merges with byte fallback.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use color_eyre::eyre::{ensure, eyre};
 use serde::Deserialize;
@@ -76,7 +76,7 @@ struct ConfigJson {
 }
 
 impl Tokenizer {
-    pub fn load(tokenizer_json: &str, config_json: &str) -> color_eyre::Result<Self> {
+    pub fn load(tokenizer_json: &Path, config_json: &Path) -> color_eyre::Result<Self> {
         let json: TokenizerJson = serde_json::from_str(&std::fs::read_to_string(tokenizer_json)?)?;
         let config: ConfigJson = serde_json::from_str(&std::fs::read_to_string(config_json)?)?;
         let model = json.model;

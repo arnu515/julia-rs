@@ -1,5 +1,7 @@
 //! Model dimensions, read from `encoder/config.json` (ModernBERT) and `julia_config.json` (head).
 
+use std::path::Path;
+
 use color_eyre::eyre::{bail, ensure};
 use serde::Deserialize;
 
@@ -70,7 +72,7 @@ struct JuliaJson {
 }
 
 impl ModelConfig {
-    pub fn load(encoder_config_json: &str, julia_config_json: &str) -> color_eyre::Result<Self> {
+    pub fn load(encoder_config_json: &Path, julia_config_json: &Path) -> color_eyre::Result<Self> {
         let enc: EncoderJson =
             serde_json::from_str(&std::fs::read_to_string(encoder_config_json)?)?;
         let julia: JuliaJson = serde_json::from_str(&std::fs::read_to_string(julia_config_json)?)?;

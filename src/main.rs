@@ -1,6 +1,6 @@
 //! Reads requests (Julia's JSONL rows) from stdin and writes one JSON result per line.
 
-use std::{arch, io::Write};
+use std::{arch, io::Write, path::PathBuf};
 
 use color_eyre::eyre::{Context, bail, eyre};
 use julia_rs::{
@@ -22,7 +22,7 @@ fn main() -> color_eyre::Result<()> {
     }
 
     let mut args = std::env::args().skip(1);
-    let dir = args.next().ok_or_else(|| eyre!(USAGE))?;
+    let dir = PathBuf::from(args.next().ok_or_else(|| eyre!(USAGE))?);
     let (mut max_length, mut head_length) = (None, DEFAULT_HEAD_LENGTH);
     while let Some(flag) = args.next() {
         let value: usize = args
@@ -37,7 +37,7 @@ fn main() -> color_eyre::Result<()> {
         }
     }
 
-    let path = |p: &str| format!("{dir}/{p}");
+    let path = |p: &str| dir.join(p);
     let model = load_model(ModelPaths {
         safetensors_path: &path("model.safetensors"),
         encoder_config_json_path: &path("encoder/config.json"),

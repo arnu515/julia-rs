@@ -3,6 +3,7 @@
 
 use std::{
     fs::File,
+    path::Path,
     simd::{StdFloat, f32x8, num::SimdFloat},
 };
 
@@ -188,12 +189,12 @@ pub(crate) fn layernorm(row: &mut [f32], norms: &[f32], biases: Option<&[f32]>, 
 }
 
 pub struct ModelPaths<'a> {
-    pub safetensors_path: &'a str,
+    pub safetensors_path: &'a Path,
     /// ModernBERT `encoder/config.json`.
-    pub encoder_config_json_path: &'a str,
-    pub julia_config_json_path: &'a str,
-    pub tokenizer_json_path: &'a str,
-    pub tokenizer_config_json_path: &'a str,
+    pub encoder_config_json_path: &'a Path,
+    pub julia_config_json_path: &'a Path,
+    pub tokenizer_json_path: &'a Path,
+    pub tokenizer_config_json_path: &'a Path,
 }
 
 pub fn load_model(paths: ModelPaths<'_>) -> color_eyre::Result<Model> {
