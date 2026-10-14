@@ -3,11 +3,14 @@
 
 use std::simd::{Select, StdFloat, cmp::SimdPartialOrd, f32x8, num::SimdFloat};
 
+use rayon::prelude::*;
+
 use crate::{avx2::exp2, config::HEAD_DIM as HD};
 
 const HALF: usize = HD / 2;
 const QB: usize = 4; // queries per tile
 const KB: usize = 16; // keys per tile (2 x f32x8)
+const QT: usize = 2 * QB; // queries per parallel task (all heads)
 
 /// RoPE cos/sin for positions `0..n`, `[n][HD / 2]`. Rotate-half convention (dim `j` pairs with
 /// `j + HD/2`); angles in f32 like HF's `ModernBertRotaryEmbedding`.
@@ -44,7 +47,8 @@ impl Rope {
         let (sin, []) = self.sin.as_chunks::<HALF>() else {
             unreachable!()
         };
-        for ((row, c), s) in qkv.chunks_exact_mut(3 * d).zip(cos).zip(sin) {
+        let rows = qkv.par_chunks_exact_mut(3 * d).zip(cos).zip(sin);
+        rows.with_min_len(16).for_each(|((row, c), s)| {
             let (c, s) = (c.as_chunks::<8>().0, s.as_chunks::<8>().0);
             let (heads, []) = row[..2 * d].as_chunks_mut::<HD>() else {
                 unreachable!()
@@ -59,14 +63,13 @@ impl Rope {
                     *b = vb.mul_add(c, va * s).to_array(); // x2·c + x1·s
                 }
             }
-        }
+        });
     }
 }
 
 #[derive(Default)]
 pub struct Scratch {
-    kt: Vec<f32>,     // K^T for the current head: HD rows, stride n + KB
-    scores: Vec<f32>, // QB score rows
+    kt: Vec<f32>, // K^T per head: [heads][HD] rows, stride n + KB
 }
 
 /// In-place p = 2^(p - max(p)); returns the sum.
@@ -143,92 +146,103 @@ pub fn attention_q(
     let qscale = std::f32::consts::LOG2_E / (HD as f32).sqrt();
     let ks = n + KB; // padded so a 16-key tile never runs past the end
     s.kt.clear();
-    s.kt.resize(HD * ks, 0.0);
+    s.kt.resize(d * ks, 0.0);
+
+    // 1. Transpose each head's K so SIMD lanes index keys.
+    s.kt.par_chunks_mut(HD * ks)
+        .enumerate()
+        .for_each(|(h, kt)| {
+            for j in 0..n {
+                for (t, &x) in kv[j * kvs + h * HD..][..HD].iter().enumerate() {
+                    kt[t * ks + j] = x;
+                }
+            }
+        });
 
     let range = |i: usize| match window {
         Some(w) => (i.saturating_sub(w), (i + w + 1).min(n)),
         None => (0, n),
     };
 
-    for h in 0..d / HD {
-        let (ko, vo) = (h * HD, d + h * HD);
+    // 2-4 in parallel over blocks of QT queries, each doing every head, so a task's output rows
+    // are its own contiguous chunk of `o`.
+    let kt = &s.kt;
+    o.par_chunks_mut(QT * d)
+        .enumerate()
+        .for_each_init(Vec::new, |scores, (b, o)| {
+            for h in 0..d / HD {
+                let (kt, vo) = (&kt[h * HD * ks..][..HD * ks], d + h * HD);
+                for l0 in (0..o.len() / d).step_by(QB) {
+                    let i0 = b * QT + l0;
+                    let tq = QB.min(nq - i0);
+                    let lo = range(i0).0;
+                    let hi = range(i0 + tq - 1).1;
+                    let span = hi - lo;
+                    let ss = span.next_multiple_of(KB);
+                    scores.clear();
+                    scores.resize(QB * ss, 0.0);
 
-        // 1. Transpose this head's K so SIMD lanes index keys.
-        for j in 0..n {
-            for (t, &x) in kv[j * kvs + ko..][..HD].iter().enumerate() {
-                s.kt[t * ks + j] = x;
-            }
-        }
+                    // Scaled queries; rows past nq duplicate the last one (discarded).
+                    let mut qt = [[0f32; HD]; QB];
+                    for (r, qr) in qt.iter_mut().enumerate() {
+                        let src = &q[(i0 + r.min(tq - 1)) * qs + h * HD..][..HD];
+                        for (dst, &x) in qr.iter_mut().zip(src) {
+                            *dst = x * qscale;
+                        }
+                    }
 
-        for i0 in (0..nq).step_by(QB) {
-            let tq = QB.min(nq - i0);
-            let lo = range(i0).0;
-            let hi = range(i0 + tq - 1).1;
-            let span = hi - lo;
-            let ss = span.next_multiple_of(KB);
-            s.scores.clear();
-            s.scores.resize(QB * ss, 0.0);
+                    // 2. S = Q K^T in 4x16 tiles: 8 independent FMA chains, no reductions.
+                    for jb in (0..span).step_by(KB) {
+                        let mut acc = [[f32x8::splat(0.0); 2]; QB];
+                        for t in 0..HD {
+                            let k = &kt[t * ks + lo + jb..][..KB];
+                            let k0 = f32x8::from_slice(&k[..8]);
+                            let k1 = f32x8::from_slice(&k[8..]);
+                            for r in 0..QB {
+                                let qv = f32x8::splat(qt[r][t]);
+                                acc[r][0] = qv.mul_add(k0, acc[r][0]);
+                                acc[r][1] = qv.mul_add(k1, acc[r][1]);
+                            }
+                        }
+                        for (r, a) in acc.iter().enumerate() {
+                            a[0].copy_to_slice(&mut scores[r * ss + jb..][..8]);
+                            a[1].copy_to_slice(&mut scores[r * ss + jb + 8..][..8]);
+                        }
+                    }
 
-            // Scaled queries; rows past n duplicate the last one (discarded).
-            let mut qt = [[0f32; HD]; QB];
-            for (r, qr) in qt.iter_mut().enumerate() {
-                let src = &q[(i0 + r.min(tq - 1)) * qs + h * HD..][..HD];
-                for (dst, &x) in qr.iter_mut().zip(src) {
-                    *dst = x * qscale;
-                }
-            }
+                    // 3. Softmax per query over its own window; zero the rest of the tile's span so
+                    //    all QB queries can share one pass over V.
+                    let mut inv = [0f32; QB];
+                    for (r, inv) in inv.iter_mut().enumerate().take(tq) {
+                        let (a, b) = range(i0 + r);
+                        let p = &mut scores[r * ss..][..span];
+                        *inv = 1.0 / softmax_exp2(&mut p[a - lo..b - lo]);
+                        p[..a - lo].fill(0.0);
+                        p[b - lo..].fill(0.0);
+                    }
 
-            // 2. S = Q K^T in 4x16 tiles: 8 independent FMA chains, no reductions.
-            for jb in (0..span).step_by(KB) {
-                let mut acc = [[f32x8::splat(0.0); 2]; QB];
-                for t in 0..HD {
-                    let k = &s.kt[t * ks + lo + jb..][..KB];
-                    let k0 = f32x8::from_slice(&k[..8]);
-                    let k1 = f32x8::from_slice(&k[8..]);
-                    for r in 0..QB {
-                        let qv = f32x8::splat(qt[r][t]);
-                        acc[r][0] = qv.mul_add(k0, acc[r][0]);
-                        acc[r][1] = qv.mul_add(k1, acc[r][1]);
+                    // 4. O = P V, 16 output lanes at a time: each V load feeds QB queries.
+                    for c in (0..HD).step_by(16) {
+                        let mut acc = [[f32x8::splat(0.0); 2]; QB];
+                        for j in 0..span {
+                            let v = &kv[(lo + j) * kvs + vo + c..][..16];
+                            let (v0, v1) = (f32x8::from_slice(&v[..8]), f32x8::from_slice(&v[8..]));
+                            for r in 0..QB {
+                                let p = f32x8::splat(scores[r * ss + j]);
+                                acc[r][0] = p.mul_add(v0, acc[r][0]);
+                                acc[r][1] = p.mul_add(v1, acc[r][1]);
+                            }
+                        }
+                        for r in 0..tq {
+                            let out = &mut o[(l0 + r) * d + h * HD + c..][..16];
+                            let iv = f32x8::splat(inv[r]);
+                            (acc[r][0] * iv).copy_to_slice(&mut out[..8]);
+                            (acc[r][1] * iv).copy_to_slice(&mut out[8..]);
+                        }
                     }
                 }
-                for (r, a) in acc.iter().enumerate() {
-                    a[0].copy_to_slice(&mut s.scores[r * ss + jb..][..8]);
-                    a[1].copy_to_slice(&mut s.scores[r * ss + jb + 8..][..8]);
-                }
             }
-
-            // 3. Softmax per query over its own window; zero the rest of the tile's span so
-            //    all QB queries can share one pass over V.
-            let mut inv = [0f32; QB];
-            for (r, inv) in inv.iter_mut().enumerate().take(tq) {
-                let (a, b) = range(i0 + r);
-                let p = &mut s.scores[r * ss..][..span];
-                *inv = 1.0 / softmax_exp2(&mut p[a - lo..b - lo]);
-                p[..a - lo].fill(0.0);
-                p[b - lo..].fill(0.0);
-            }
-
-            // 4. O = P V, 16 output lanes at a time: each V load feeds QB queries.
-            for c in (0..HD).step_by(16) {
-                let mut acc = [[f32x8::splat(0.0); 2]; QB];
-                for j in 0..span {
-                    let v = &kv[(lo + j) * kvs + vo + c..][..16];
-                    let (v0, v1) = (f32x8::from_slice(&v[..8]), f32x8::from_slice(&v[8..]));
-                    for r in 0..QB {
-                        let p = f32x8::splat(s.scores[r * ss + j]);
-                        acc[r][0] = p.mul_add(v0, acc[r][0]);
-                        acc[r][1] = p.mul_add(v1, acc[r][1]);
-                    }
-                }
-                for r in 0..tq {
-                    let out = &mut o[(i0 + r) * d + h * HD + c..][..16];
-                    let iv = f32x8::splat(inv[r]);
-                    (acc[r][0] * iv).copy_to_slice(&mut out[..8]);
-                    (acc[r][1] * iv).copy_to_slice(&mut out[8..]);
-                }
-            }
-        }
-    }
+        });
 }
 
 #[cfg(test)]

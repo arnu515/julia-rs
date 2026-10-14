@@ -1,6 +1,7 @@
 //! Julia's decision head (`julia/model.py`): type embedding, `nn.TransformerEncoderLayer`s
 //! (pre-norm, biases, ReLU, global attention without RoPE) and the per-option scorer.
 
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::{
@@ -80,9 +81,9 @@ impl Model {
         );
 
         let te = &self.weights.type_emb.as_f32(data)[qtype as usize * d..][..d];
-        for row in x.chunks_exact_mut(d) {
-            f32_vec_add(row, te);
-        }
+        x.par_chunks_exact_mut(d)
+            .with_min_len(16)
+            .for_each(|row| f32_vec_add(row, te));
         let Some((last, dense)) = self.weights.head.split_last() else {
             return self.score(gather(&x, markers, d));
         };
@@ -170,12 +171,14 @@ impl Model {
             d,
             f,
         );
-        for v in f.iter_mut() {
-            // not f32::max, whose NaN handling stops it compiling to a plain vmaxps
-            if *v < 0.0 {
-                *v = 0.0;
+        f.par_chunks_mut(4096).for_each(|f| {
+            for v in f {
+                // not f32::max, whose NaN handling stops it compiling to a plain vmaxps
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
             }
-        }
+        });
         linear(
             f,
             l.linear2_w.as_f32(data),

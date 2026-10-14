@@ -3,6 +3,8 @@
 use std::f32::consts::LOG2_E;
 use std::simd::{Select, StdFloat, cmp::SimdPartialOrd, f32x8, num::SimdFloat};
 
+use rayon::prelude::*;
+
 use crate::avx2::exp2;
 
 /// Exact GELU, x·Φ(x), with Φ from Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7·|x|).
@@ -35,30 +37,31 @@ pub fn gelu_inplace(x: &mut [f32]) {
     }
 }
 
-/// GeGLU on `hh` = x·Wiᵀ, rows of `[inp | gate]` (each `inter` wide): returns the first
-/// `n * inter` values of `hh`, overwritten with GELU(inp) ⊙ gate. Row r is compacted into
-/// `hh[r*inter..]`, which never overlaps the part of row r (at `2*r*inter..`) not yet read, so no
-/// second N×inter buffer is needed.
-pub fn geglu(hh: &mut [f32], inter: usize) -> &[f32] {
+/// GeGLU on `hh` = x·Wiᵀ, rows of `[inp | gate]` (each `inter` wide): `m` = GELU(inp) ⊙ gate,
+/// `[n, inter]`, in parallel over rows.
+pub fn geglu(hh: &[f32], inter: usize, m: &mut [f32]) {
     assert!(
-        inter.is_multiple_of(8) && hh.len().is_multiple_of(2 * inter),
-        "geglu: bad shapes (hh {}, inter {inter})",
-        hh.len()
+        inter.is_multiple_of(8) && hh.len() == 2 * m.len() && m.len().is_multiple_of(inter),
+        "geglu: bad shapes (hh {}, m {}, inter {inter})",
+        hh.len(),
+        m.len()
     );
-    let n = hh.len() / (2 * inter);
-    let (h8, []) = hh.as_chunks_mut::<8>() else {
-        unreachable!()
-    };
-    let k = inter / 8;
-    for r in 0..n {
-        let (src, dst) = (2 * r * k, r * k);
-        for j in 0..k {
-            let a = f32x8::from_array(h8[src + j]);
-            let g = f32x8::from_array(h8[src + k + j]);
-            h8[dst + j] = (gelu(a) * g).to_array();
+    let rows = hh
+        .par_chunks_exact(2 * inter)
+        .zip(m.par_chunks_exact_mut(inter));
+    rows.with_min_len(8).for_each(|(h, m)| {
+        let (inp, gate) = h.split_at(inter);
+        let (m, []) = m.as_chunks_mut::<8>() else {
+            unreachable!()
+        };
+        for ((m, a), g) in m
+            .iter_mut()
+            .zip(inp.as_chunks::<8>().0)
+            .zip(gate.as_chunks::<8>().0)
+        {
+            *m = (gelu(f32x8::from_array(*a)) * f32x8::from_array(*g)).to_array();
         }
-    }
-    &hh[..n * inter]
+    });
 }
 
 #[cfg(test)]
@@ -97,8 +100,8 @@ mod tests {
                 gelu_ref(hh[r * 2 * inter + j]) * hh[r * 2 * inter + inter + j]
             })
             .collect();
-        let mut got = hh.clone();
-        let got = geglu(&mut got, inter);
+        let mut got = vec![0.0; n * inter];
+        geglu(&hh, inter, &mut got);
         let err = got
             .iter()
             .zip(&want)
