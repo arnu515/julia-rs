@@ -31,7 +31,7 @@ const USAGE: &str = "usage: julia-rs <checkpoint dir> [--max-length N] [--head-l
   One per physical performance core is usually fastest: hyperthreads and slow cores mostly
   contend for cache and memory, and a slow core holds up every step.
   --workers (requests run at once, each on one thread, when several are waiting) defaults to
-  --threads. Here efficiency cores do help: on a Core Ultra 7 185H, --threads 6 --workers 14 on
+  --threads. Here efficiency cores do help: on a Core Ultra 9 185H, --threads 6 --workers 14 on
   the 6 performance + 8 efficiency cores gave 25-33% more throughput than the performance cores
   alone, while a lone request took ~14% longer (its threads sometimes land on slow cores).";
 
