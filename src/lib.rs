@@ -1,4 +1,5 @@
 #![feature(portable_simd)]
+#![cfg_attr(test, feature(float_erf))]
 
 use std::{
     fs::File,
@@ -9,14 +10,22 @@ use color_eyre::eyre::{bail, ensure};
 use memmap2::Mmap;
 
 pub mod attn;
+pub mod avx2;
 pub mod config;
 pub mod matmul;
+pub mod mlp;
 pub mod safetensors;
 pub mod tokenizer;
 
 use config::ModelConfig;
 use safetensors::Weights;
 use tokenizer::Tokenizer;
+
+use crate::{
+    attn::{Rope, Scratch, attention},
+    matmul::linear,
+    mlp::geglu,
+};
 
 pub struct Model {
     pub file: File,
@@ -50,6 +59,79 @@ impl Model {
             );
         }
         x
+    }
+
+    pub fn encode(&self, tokens: &[u32], mut tap: impl FnMut(&str, &[f32])) -> Vec<f32> {
+        let (n, d, inter, eps) = (
+            tokens.len(),
+            self.config.hidden,
+            self.config.intermediate,
+            self.config.norm_eps,
+        );
+        let mut x = self.embed(tokens);
+        let (mut h, mut o) = (vec![0f32; n * d], vec![0f32; n * d]);
+        let mut qkv = vec![0.0; n * 3 * d];
+        let mut hh = vec![0.0; n * 2 * inter];
+        let mut s = Scratch::default();
+        let rope_g = Rope::new(self.config.rope_theta_global, n);
+        let rope_l = Rope::new(self.config.rope_theta_local, n);
+
+        let data = self.data();
+        for (i, l) in self.weights.encoder.layers.iter().enumerate() {
+            // attention
+            norm_rows(
+                &x,
+                l.attn_norm.as_ref().map(|t| t.as_f32(data)),
+                None,
+                eps,
+                &mut h,
+            );
+            linear(&h, l.wqkv.as_f32(data), None, d, &mut qkv);
+            let (rope, window) = if l.global {
+                (&rope_g, None)
+            } else {
+                (&rope_l, Some(self.config.local_window / 2))
+            };
+            rope.apply(&mut qkv, d);
+            attention(&qkv, n, d, window, &mut o, &mut s);
+            linear(&o, l.wo.as_f32(data), None, d, &mut h);
+            f32_vec_add(&mut x, &h);
+
+            // MLP
+            norm_rows(&x, Some(l.mlp_norm.as_f32(data)), None, eps, &mut h);
+            linear(&h, l.wi.as_f32(data), None, d, &mut hh);
+            let m = geglu(&mut hh, inter);
+            linear(m, l.wo_mlp.as_f32(data), None, inter, &mut h);
+            f32_vec_add(&mut x, &h);
+
+            tap(&format!("layer{i:02}"), &x);
+        }
+        {
+            let norms = self.weights.encoder.final_norm.as_f32(data);
+            for row in x.chunks_exact_mut(d) {
+                layernorm(row, norms, None, eps);
+            }
+            tap("final_norm", &x);
+        }
+
+        x
+    }
+}
+
+fn f32_vec_add(a: &mut [f32], b: &[f32]) {
+    assert!(a.len() == b.len());
+    for (a, &b) in a.iter_mut().zip(b) {
+        *a += b;
+    }
+}
+
+fn norm_rows(x: &[f32], norms: Option<&[f32]>, biases: Option<&[f32]>, eps: f32, out: &mut [f32]) {
+    out.copy_from_slice(x);
+    if let Some(norms) = norms {
+        assert!(out.len().is_multiple_of(norms.len()));
+        for chunk in out.chunks_exact_mut(norms.len()) {
+            layernorm(chunk, norms, biases, eps);
+        }
     }
 }
 

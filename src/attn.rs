@@ -1,13 +1,9 @@
 //! Multi-head attention over a fused `[q | k | v]` buffer, plus ModernBERT's RoPE.
 //! The encoder applies `Rope` first; the head's attention uses no RoPE.
 
-use std::simd::{
-    Select, StdFloat, f32x8, u32x8,
-    cmp::SimdPartialOrd,
-    num::SimdFloat,
-};
+use std::simd::{Select, StdFloat, cmp::SimdPartialOrd, f32x8, num::SimdFloat};
 
-use crate::config::HEAD_DIM as HD;
+use crate::{avx2::exp2, config::HEAD_DIM as HD};
 
 const HALF: usize = HD / 2;
 const QB: usize = 4; // queries per tile
@@ -38,7 +34,10 @@ impl Rope {
 
     /// Rotates every q and k head of `qkv` (`[n, 3d]`, row `p` at position `p`). V is untouched.
     pub fn apply(&self, qkv: &mut [f32], d: usize) {
-        assert!(qkv.len() / (3 * d) * HALF <= self.cos.len(), "rope table too short");
+        assert!(
+            qkv.len() / (3 * d) * HALF <= self.cos.len(),
+            "rope table too short"
+        );
         let (cos, []) = self.cos.as_chunks::<HALF>() else {
             unreachable!()
         };
@@ -68,30 +67,6 @@ impl Rope {
 pub struct Scratch {
     kt: Vec<f32>,     // K^T for the current head: HD rows, stride n + KB
     scores: Vec<f32>, // QB score rows
-}
-
-/// 2^x for x <= 0. ~2e-7 relative error.
-#[inline(always)]
-fn exp2(x: f32x8) -> f32x8 {
-    let lo = f32x8::splat(-126.0);
-    let x = x.simd_lt(lo).select(lo, x);
-    // Adding 1.5·2^23 rounds x to the nearest integer n, which lands in the low mantissa bits
-    // of t. This is ~5x faster than floor() + a float->int cast.
-    const MAGIC: f32 = 12582912.0;
-    let t = x + f32x8::splat(MAGIC);
-    let n = t - f32x8::splat(MAGIC);
-    let f = x - n; // [-0.5, 0.5]
-    // Taylor series of 2^f; truncation error ~1.2e-7 on this range.
-    let mut p = f32x8::splat(1.540353e-4);
-    p = p.mul_add(f, f32x8::splat(1.333356e-3));
-    p = p.mul_add(f, f32x8::splat(9.618129e-3));
-    p = p.mul_add(f, f32x8::splat(5.550411e-2));
-    p = p.mul_add(f, f32x8::splat(2.402265e-1));
-    p = p.mul_add(f, f32x8::splat(6.931472e-1));
-    p = p.mul_add(f, f32x8::splat(1.0));
-    // 2^n: exponent field n + 127 (wrapping u32 math handles negative n).
-    let bits = (t.to_bits() - u32x8::splat(0x4B40_0000 - 127)) << u32x8::splat(23);
-    p * f32x8::from_bits(bits)
 }
 
 /// In-place p = 2^(p - max(p)); returns the sum.
@@ -245,13 +220,22 @@ mod tests {
                 };
                 let s: Vec<f64> = keys
                     .clone()
-                    .map(|j| (0..HD).map(|t| at(i, h * HD + t) * at(j, d + h * HD + t)).sum::<f64>() / (HD as f64).sqrt())
+                    .map(|j| {
+                        (0..HD)
+                            .map(|t| at(i, h * HD + t) * at(j, d + h * HD + t))
+                            .sum::<f64>()
+                            / (HD as f64).sqrt()
+                    })
                     .collect();
                 let max = s.iter().copied().fold(f64::MIN, f64::max);
                 let p: Vec<f64> = s.iter().map(|x| (x - max).exp()).collect();
                 let sum: f64 = p.iter().sum();
                 for t in 0..HD {
-                    let v: f64 = keys.clone().zip(&p).map(|(j, p)| p * at(j, 2 * d + h * HD + t)).sum();
+                    let v: f64 = keys
+                        .clone()
+                        .zip(&p)
+                        .map(|(j, p)| p * at(j, 2 * d + h * HD + t))
+                        .sum();
                     o[i * d + h * HD + t] = (v / sum) as f32;
                 }
             }
@@ -273,12 +257,22 @@ mod tests {
         let d = 2 * HD;
         let mut scratch = Scratch::default();
         // n not a multiple of the 4-query / 16-key tiles; windows narrower than n.
-        for (n, window) in [(1, None), (37, None), (37, Some(64)), (150, Some(64)), (150, Some(5))] {
+        for (n, window) in [
+            (1, None),
+            (37, None),
+            (37, Some(64)),
+            (150, Some(64)),
+            (150, Some(5)),
+        ] {
             let qkv = rnd(n * 3 * d);
             let mut o = vec![0.0; n * d];
             attention(&qkv, n, d, window, &mut o, &mut scratch);
             let want = naive(&qkv, n, d, window);
-            let err = o.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            let err = o
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
             assert!(err < 1e-5, "n={n} window={window:?}: max err {err}");
         }
     }
