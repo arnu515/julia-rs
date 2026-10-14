@@ -23,9 +23,10 @@ use julia_rs::{
 use serde_json::json;
 
 const USAGE: &str = "usage: julia-rs <checkpoint dir> [--max-length N] [--head-length N] \
-[--threads N] [--precision f32|i16] < requests.jsonl
+[--threads N] [--precision f32|i16|i8] < requests.jsonl
   --precision i16 runs the linear layers in 13-bit integers: faster, with logits that differ
-  slightly from the f32 reference (default f32).
+  slightly from the f32 reference (default f32). i8 (8-bit) is faster still but changes some
+  answers.
   --threads defaults to RAYON_NUM_THREADS, else every logical CPU. One per physical performance
   core is usually fastest: hyperthreads and slow cores mostly contend for cache and memory.";
 

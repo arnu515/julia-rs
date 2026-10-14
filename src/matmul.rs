@@ -1,15 +1,18 @@
 //! y = x·Wᵀ + b with W packed once at load time for a 6×16 register-tile kernel, in f32 or in
-//! 13-bit integers (AVX-VNNI).
+//! integers (AVX-VNNI).
 
 use std::{
     arch::{
         asm,
-        x86_64::{__m256i, _mm256_cvtps_epi32, _mm256_packs_epi32, _mm256_permute4x64_epi64},
+        x86_64::{
+            __m256i, _mm256_cvtps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_packs_epi32,
+            _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_permutevar8x32_epi32,
+        },
     },
     simd::{
         StdFloat,
         cmp::SimdOrd,
-        f32x8, i16x16, i32x8,
+        f32x8, i8x32, i16x16, i32x8,
         num::{SimdFloat, SimdInt, SimdUint},
     },
     str::FromStr,
@@ -41,6 +44,8 @@ const L16: f32 = 4095.0;
 /// stay below 2³¹, so the integer sums can't overflow.
 const KP16: usize = 64;
 const _: () = assert!(2 * KP16 as u64 * (L16 as u64).pow(2) < 1 << 31);
+/// Largest weight in [`Precision::I8`] (symmetric int8).
+const L8: f32 = 127.0;
 
 /// Number format of the packed weights and of the activations multiplied with them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,6 +56,10 @@ pub enum Precision {
     /// Weights with one scale per output, activations with one per token, both as 13-bit integers
     /// in i16. About bf16's accuracy and 2× the multiply-adds per instruction (`vpdpwssd`).
     I16,
+    /// Weights as int8 with one scale per output, activations as u8 with a scale and zero point
+    /// per token: 4× the multiply-adds per instruction (`vpdpbusd`), but lossy. On 100 benchmark
+    /// questions, 9 answers differed from f32's and logits moved by 1.1 on average.
+    I8,
 }
 
 impl FromStr for Precision {
@@ -59,14 +68,15 @@ impl FromStr for Precision {
         Ok(match s {
             "f32" => Self::F32,
             "i16" => Self::I16,
-            _ => bail!("unknown precision {s:?} (f32, i16)"),
+            "i8" => Self::I8,
+            _ => bail!("unknown precision {s:?} (f32, i16, i8)"),
         })
     }
 }
 
 /// A weight matrix `[out, inp]` repacked as panels of 16 outputs, so the kernel reads 16
-/// outputs' weights for one input index (f32) or input pair (i16) as two contiguous vectors. The
-/// last panel is zero-padded.
+/// outputs' weights for one input index (f32), pair (i16) or quad (i8) as two contiguous vectors.
+/// The last panel is zero-padded.
 pub struct Packed {
     panels: Panels,
     inp: usize,
@@ -81,6 +91,13 @@ enum Panels {
     I16 {
         panels: Vec<[i16; 2 * NR]>,
         scale: Vec<f32>,
+    },
+    /// `[inp / 4][16][4]` per panel (`vpdpbusd` sums groups of 4), inputs padded to a multiple of
+    /// 4, one scale per output and each output's sum of integer weights, for the zero points.
+    I8 {
+        panels: Vec<[i8; 4 * NR]>,
+        scale: Vec<f32>,
+        sum: Vec<i32>,
     },
 }
 
@@ -115,7 +132,7 @@ impl Packed {
                     .zip(scale.par_chunks_mut(NR));
                 chunks.enumerate().for_each(|(p, (panel, scale))| {
                     for (c, row) in rows(p) {
-                        let (s, inv) = scales(row);
+                        let (s, inv) = scales(row, L16);
                         scale[c] = s;
                         for (k, &v) in row.iter().enumerate() {
                             panel[k / 2][2 * c + k % 2] = (v * inv).round_ties_even() as i16;
@@ -123,6 +140,29 @@ impl Packed {
                     }
                 });
                 Panels::I16 { panels, scale }
+            }
+            Precision::I8 => {
+                // u8 · i8 products are <= 255 · 127, so i32 sums can't overflow below 66k inputs.
+                assert!(inp < 1 << 16, "Packed: {inp} inputs could overflow i8 sums");
+                let kq = inp.div_ceil(4);
+                let mut panels = vec![[0i8; 4 * NR]; out.div_ceil(NR) * kq];
+                let (mut scale, mut sum) = (vec![0f32; out.div_ceil(NR) * NR], vec![0; 0]);
+                sum.resize(scale.len(), 0);
+                let chunks = (panels.par_chunks_exact_mut(kq))
+                    .zip(scale.par_chunks_mut(NR))
+                    .zip(sum.par_chunks_mut(NR));
+                chunks.enumerate().for_each(|(p, ((panel, scale), sum))| {
+                    for (c, row) in rows(p) {
+                        let (s, inv) = scales(row, L8);
+                        scale[c] = s;
+                        for (k, &v) in row.iter().enumerate() {
+                            let q = (v * inv).round_ties_even() as i8;
+                            panel[k / 4][4 * c + k % 4] = q;
+                            sum[c] += q as i32;
+                        }
+                    }
+                });
+                Panels::I8 { panels, scale, sum }
             }
         };
         Self { panels, inp, out }
@@ -141,14 +181,31 @@ fn max_abs(x: &[f32]) -> f32 {
     tail.iter().fold(m, |m, v| m.max(v.abs()))
 }
 
-/// Symmetric 13-bit scale of a row and its inverse: x ≈ scale · round(x · inverse).
-fn scales(x: &[f32]) -> (f32, f32) {
+/// Symmetric scale of a row for integers up to `l`, and its inverse: x ≈ scale · round(x ·
+/// inverse).
+fn scales(x: &[f32], l: f32) -> (f32, f32) {
     let m = max_abs(x);
-    if m > 0.0 {
-        (m / L16, L16 / m)
-    } else {
-        (0.0, 0.0)
-    }
+    if m > 0.0 { (m / l, l / m) } else { (0.0, 0.0) }
+}
+
+/// min(x, 0) and max(x, 0), vectorised.
+fn min_max(x: &[f32]) -> (f32, f32) {
+    let (v, tail) = x.as_chunks::<8>();
+    let zero = f32x8::splat(0.0);
+    let (lo, hi) = v.iter().fold((zero, zero), |(lo, hi), &v| {
+        // SAFETY: AVX (crate target features, checked in `main`). Plain vminps/vmaxps; the
+        // portable versions add NaN handling.
+        unsafe {
+            let v = f32x8::from_array(v).into();
+            (
+                _mm256_min_ps(lo.into(), v).into(),
+                _mm256_max_ps(hi.into(), v).into(),
+            )
+        }
+    });
+    let (lo, hi) = (lo.reduce_min(), hi.reduce_max());
+    tail.iter()
+        .fold((lo, hi), |(lo, hi), &v| (lo.min(v), hi.max(v)))
 }
 
 /// The rows of `x` (`[n, inp]`) as 13-bit integers, each adjacent pair packed into one i32 (the
@@ -162,7 +219,7 @@ fn quantize_i16(x: &[f32], inp: usize) -> (Vec<i32>, Vec<f32>) {
         .zip(x.par_chunks_exact(inp));
     rows.with_min_len(16).for_each(|((q, s), x)| {
         let inv;
-        (*s, inv) = scales(x);
+        (*s, inv) = scales(x, L16);
         // SAFETY: an i32 slice reinterpreted as twice as many i16s (x86 is little-endian, so
         // input 2k is the low half of pair k).
         let q = unsafe { std::slice::from_raw_parts_mut(q.as_mut_ptr().cast::<i16>(), 2 * kp) };
@@ -178,6 +235,38 @@ fn quantize_i16(x: &[f32], inp: usize) -> (Vec<i32>, Vec<f32>) {
         }
     });
     (q, s)
+}
+
+/// The rows of `x` (`[n, inp]`) as u8 with a scale and zero point per row (x ≈ scale · (u -
+/// zero)), each 4 adjacent inputs packed into one i32 (the operand `vpdpbusd` broadcasts; inputs
+/// past `inp` are 0 and meet zero-padded weights).
+fn quantize_u8(x: &[f32], inp: usize) -> (Vec<i32>, Vec<f32>, Vec<i32>) {
+    let (n, kq) = (x.len() / inp, inp.div_ceil(4));
+    let (mut q, mut s, mut z) = (vec![0i32; n * kq], vec![0f32; n], vec![0i32; n]);
+    let rows = (q.par_chunks_exact_mut(kq).zip(&mut s).zip(&mut z)).zip(x.par_chunks_exact(inp));
+    rows.with_min_len(16).for_each(|(((q, s), z), x)| {
+        let (lo, hi) = min_max(x);
+        if hi == lo {
+            return; // all zeros: scale 0
+        }
+        *s = (hi - lo) / 255.0;
+        let inv = 255.0 / (hi - lo);
+        *z = (-lo * inv).round_ties_even() as i32;
+        let zf = *z as f32;
+        // SAFETY: an i32 slice reinterpreted as 4× as many u8s (little-endian, so input 4k + i
+        // is byte i of quad k).
+        let q = unsafe { std::slice::from_raw_parts_mut(q.as_mut_ptr().cast::<u8>(), 4 * kq) };
+        let (xv, tail) = x.as_chunks::<32>();
+        let (qv, qtail) = q.as_chunks_mut::<32>();
+        let u = |x: &[f32]| f32x8::from_slice(x) * f32x8::splat(inv) + f32x8::splat(zf);
+        for (q, x) in qv.iter_mut().zip(xv) {
+            *q = to_u8([u(&x[..8]), u(&x[8..16]), u(&x[16..24]), u(&x[24..])]);
+        }
+        for (q, &x) in qtail.iter_mut().zip(tail) {
+            *q = (x * inv + zf).round_ties_even().clamp(0.0, 255.0) as u8;
+        }
+    });
+    (q, s, z)
 }
 
 /// `y`'s base pointer, shared by the tasks of one `linear` call. Each task writes only its own
@@ -224,6 +313,18 @@ pub fn linear(x: &[f32], w: &Packed, b: Option<&[f32]>, y: &mut [f32]) {
                 match m {
                     MR => store(tile_i16::<MR>(&xq, panel, &sx, sw, t), out, b, y, t, j),
                     _ => store(tile_i16::<1>(&xq, panel, &sx, sw, t), out, b, y, t, j),
+                }
+            })
+        }
+        Panels::I8 { panels, scale, sum } => {
+            let (xq, sx, zx) = quantize_u8(x, inp);
+            let kq = inp.div_ceil(4);
+            tiles(n, out, |t, m, j| {
+                let panel = &panels[j / NR * kq..][..kq];
+                let w = (panel, &scale[j..][..NR], &sum[j..][..NR]);
+                match m {
+                    MR => store(tile_i8::<MR>(&xq, &sx, &zx, w, t), out, b, y, t, j),
+                    _ => store(tile_i8::<1>(&xq, &sx, &zx, w, t), out, b, y, t, j),
                 }
             })
         }
@@ -315,6 +416,38 @@ fn tile_i16<const M: usize>(
     sum
 }
 
+/// [`tile_f32`] on u8 activations (`x` packed in quads, `sx` scales, `zx` zero points) and one i8
+/// panel (with its output scales and weight sums).
+#[inline(always)]
+fn tile_i8<const M: usize>(
+    x: &[i32],
+    sx: &[f32],
+    zx: &[i32],
+    (panel, sw, sum): (&[[i8; 4 * NR]], &[f32], &[i32]),
+    t: usize,
+) -> [[f32x8; 2]; M] {
+    let kq = panel.len();
+    let xr: [&[i32]; M] = std::array::from_fn(|r| &x[(t + r) * kq..][..kq]);
+    let mut acc = [[__m256i::from(i32x8::splat(0)); 2]; M];
+    for (k, w) in panel.iter().enumerate() {
+        let w0 = __m256i::from(i8x32::from_slice(&w[..2 * NR]));
+        let w1 = __m256i::from(i8x32::from_slice(&w[2 * NR..]));
+        for r in 0..M {
+            let xv = __m256i::from(i32x8::splat(xr[r][k]));
+            acc[r][0] = dpbusd(acc[r][0], xv, w0);
+            acc[r][1] = dpbusd(acc[r][1], xv, w1);
+        }
+    }
+    // Σ (u - z)·w = Σ u·w - z·Σ w, exactly in i32; then scale.
+    let (c0, c1) = (i32x8::from_slice(&sum[..8]), i32x8::from_slice(&sum[8..]));
+    let (s0, s1) = (f32x8::from_slice(&sw[..8]), f32x8::from_slice(&sw[8..]));
+    std::array::from_fn(|r| {
+        let (z, s) = (i32x8::splat(zx[t + r]), f32x8::splat(sx[t + r]));
+        let a = |acc: __m256i, c: i32x8| (i32x8::from(acc) - z * c).cast::<f32>();
+        [a(acc[r][0], c0) * (s * s0), a(acc[r][1], c1) * (s * s1)]
+    })
+}
+
 /// a and b rounded to the nearest integers (ties to even), in order. Values must fit i16.
 #[inline(always)]
 fn to_i16(a: f32x8, b: f32x8) -> i16x16 {
@@ -323,6 +456,20 @@ fn to_i16(a: f32x8, b: f32x8) -> i16x16 {
         let (a, b) = (_mm256_cvtps_epi32(a.into()), _mm256_cvtps_epi32(b.into()));
         // packs interleaves 128-bit halves (a0-3 b0-3 a4-7 b4-7); the permute restores order.
         _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(a, b)).into()
+    }
+}
+
+/// 32 values rounded to the nearest integers (ties to even) and clamped to u8, in order.
+#[inline(always)]
+fn to_u8(v: [f32x8; 4]) -> [u8; 32] {
+    // SAFETY: AVX2 (crate target features, checked in `main`).
+    unsafe {
+        let [a, b, c, d] = v.map(|v| _mm256_cvtps_epi32(v.into()));
+        // Saturating packs work per 128-bit half: dwords come out a0 b0 c0 d0 a1 b1 c1 d1, where
+        // a0 is a's first 4 values.
+        let p = _mm256_packus_epi16(_mm256_packs_epi32(a, b), _mm256_packs_epi32(c, d));
+        let order = i32x8::from_array([0, 4, 1, 5, 2, 6, 3, 7]).into();
+        std::mem::transmute(_mm256_permutevar8x32_epi32(p, order))
     }
 }
 
@@ -335,6 +482,23 @@ fn dpwssd(mut acc: __m256i, a: __m256i, b: __m256i) -> __m256i {
     unsafe {
         asm!(
             "{{vex}} vpdpwssd {acc}, {a}, {b}",
+            acc = inout(ymm_reg) acc,
+            a = in(ymm_reg) a,
+            b = in(ymm_reg) b,
+            options(pure, nomem, nostack),
+        );
+    }
+    acc
+}
+
+/// acc + Σ groups of 4 u8 a × i8 b, per i32 lane.
+#[inline(always)]
+fn dpbusd(mut acc: __m256i, a: __m256i, b: __m256i) -> __m256i {
+    // Inline asm for the same reason as `dpwssd`.
+    // SAFETY: the crate is built with AVX-VNNI (.cargo/config.toml), and `main` checks for it.
+    unsafe {
+        asm!(
+            "{{vex}} vpdpbusd {acc}, {a}, {b}",
             acc = inout(ymm_reg) acc,
             a = in(ymm_reg) a,
             b = in(ymm_reg) b,
@@ -377,11 +541,11 @@ fn store<const M: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::{L16, Packed, Precision, linear};
+    use super::{L8, L16, Packed, Precision, linear};
 
     /// The exact product, and how far `precision` may stray from it: rounding each integer to the
     /// nearest step moves x by ≤ sx/2 and w by ≤ sw/2, so a product by ≤ |x|·sw/2 + |w|·sx/2 +
-    /// sx·sw/4.
+    /// sx·sw/4. (f32: a 1e-5 margin only.)
     fn naive(
         x: &[f32],
         w: &[f32],
@@ -389,19 +553,28 @@ mod tests {
         inp: usize,
         precision: Precision,
     ) -> Vec<(f32, f32)> {
-        let step = |r: &[f32]| r.iter().fold(0f32, |m, v| m.max(v.abs())) as f64 / L16 as f64;
+        let max = |r: &[f32]| r.iter().fold(0f32, |m, v| m.max(v.abs())) as f64;
+        let range = |r: &[f32]| {
+            let (lo, hi) = r
+                .iter()
+                .fold((0f32, 0f32), |(l, h), &v| (l.min(v), h.max(v)));
+            (hi - lo) as f64
+        };
+        let steps = |x: &[f32], w: &[f32]| match precision {
+            Precision::F32 => (0.0, 0.0),
+            Precision::I16 => (max(x) / L16 as f64, max(w) / L16 as f64),
+            Precision::I8 => (range(x) / 255.0, max(w) / L8 as f64),
+        };
         let (n, out) = (x.len() / inp, w.len() / inp);
         let mut y = Vec::with_capacity(n * out);
         for xr in x.chunks_exact(inp) {
             for (o, wr) in w.chunks_exact(inp).enumerate() {
-                let (sx, sw) = (step(xr), step(wr));
+                let (sx, sw) = steps(xr, wr);
                 let (mut dot, mut tol) = (0f64, 1e-5);
                 for (&a, &c) in xr.iter().zip(wr) {
                     let (a, c) = (a as f64, c as f64);
                     dot += a * c;
-                    if precision == Precision::I16 {
-                        tol += a.abs() * sw / 2.0 + c.abs() * sx / 2.0 + sx * sw / 4.0;
-                    }
+                    tol += a.abs() * sw / 2.0 + c.abs() * sx / 2.0 + sx * sw / 4.0;
                 }
                 y.push((dot as f32 + b.map_or(0.0, |b| b[o]), tol as f32));
             }
@@ -409,8 +582,53 @@ mod tests {
         y
     }
 
+    /// `linear` redone in scalar code: the same rounding to integers, exact integer sums, then the
+    /// scales. Also returns a tolerance for the kernel's f32 rounding of its integer sums.
+    fn emulate(x: &[f32], w: &[f32], inp: usize, precision: Precision) -> Vec<(f32, f32)> {
+        let max = |r: &[f32]| r.iter().fold(0f32, |m, v| m.max(v.abs()));
+        // (integers, scale, zero point) of a row.
+        let sym = |r: &[f32], l: f32| {
+            let m = max(r);
+            let inv = if m > 0.0 { l / m } else { 0.0 };
+            let q = r.iter().map(|v| (v * inv).round_ties_even() as i64);
+            (q.collect::<Vec<_>>(), m / l, 0)
+        };
+        let asym = |r: &[f32]| {
+            let (lo, hi) = r
+                .iter()
+                .fold((0f32, 0f32), |(l, h), &v| (l.min(v), h.max(v)));
+            if hi == lo {
+                return (vec![0; r.len()], 0.0, 0);
+            }
+            let inv = 255.0 / (hi - lo);
+            let z = (-lo * inv).round_ties_even();
+            let q = r
+                .iter()
+                .map(|v| (v * inv + z).round_ties_even().clamp(0.0, 255.0) as i64);
+            (q.collect(), (hi - lo) / 255.0, z as i64)
+        };
+        let mut y = vec![];
+        for xr in x.chunks_exact(inp) {
+            let (qx, sx, z) = match precision {
+                Precision::I8 => asym(xr),
+                _ => sym(xr, L16),
+            };
+            for wr in w.chunks_exact(inp) {
+                let (qw, sw, _) = sym(wr, if precision == Precision::I8 { L8 } else { L16 });
+                let dot: i64 = qx.iter().zip(&qw).map(|(a, c)| (a - z) * c).sum();
+                let abs: i64 = qx.iter().zip(&qw).map(|(a, c)| ((a - z) * c).abs()).sum();
+                let s = sx as f64 * sw as f64;
+                y.push((
+                    (dot as f64 * s) as f32,
+                    (1e-6 * abs as f64 * s + 1e-6) as f32,
+                ));
+            }
+        }
+        y
+    }
+
     #[test]
-    fn matches_naive() {
+    fn matches_naive_and_emulation() {
         let mut s = 1u32;
         let mut rnd = |len: usize| -> Vec<f32> {
             (0..len)
@@ -435,7 +653,14 @@ mod tests {
         .into_iter()
         .map(|(n, inp, out)| (inp, rnd(n * inp), rnd(out * inp), rnd(out)))
         .collect();
-        // Every integer at ±L16 and all products of one sign: the largest i32 sums possible.
+        // Every integer at its limit and all products of one sign: the largest i32 sums possible
+        // (i8: u8 255, from all-positive x, and zero point 0, in the second).
+        cases.push((
+            1152,
+            vec![1.0; 12 * 1152],
+            vec![-1.0; 20 * 1152],
+            vec![0.0; 20],
+        ));
         cases.push((
             1152,
             vec![-1.0; 12 * 1152],
@@ -443,7 +668,7 @@ mod tests {
             vec![0.0; 20],
         ));
         for (inp, x, w, b) in &cases {
-            for precision in [Precision::F32, Precision::I16] {
+            for precision in [Precision::F32, Precision::I16, Precision::I8] {
                 let packed = Packed::new(w, *inp, precision);
                 // Task blocks are fixed, but run the tests on several pool sizes anyway.
                 for (threads, b) in [1, 3, 22]
@@ -466,6 +691,20 @@ mod tests {
                             x.len() / inp,
                             w.len() / inp,
                             b.is_some(),
+                        );
+                    }
+                    if precision == Precision::F32 || b.is_some() {
+                        continue;
+                    }
+                    for (i, (&got, (want, tol))) in
+                        y.iter().zip(emulate(x, w, *inp, precision)).enumerate()
+                    {
+                        assert!(
+                            (got - want).abs() <= tol,
+                            "{precision:?} {}x{inp}->{} threads={threads}: y[{i}] = {got}, \
+                             emulated {want} ± {tol}",
+                            x.len() / inp,
+                            w.len() / inp,
                         );
                     }
                 }
