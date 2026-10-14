@@ -23,12 +23,17 @@ use julia_rs::{
 use serde_json::json;
 
 const USAGE: &str = "usage: julia-rs <checkpoint dir> [--max-length N] [--head-length N] \
-[--threads N] [--precision f32|i16|i8] < requests.jsonl
+[--threads N] [--workers N] [--precision f32|i16|i8] < requests.jsonl
   --precision i16 runs the linear layers in 13-bit integers: faster, with logits that differ
   slightly from the f32 reference (default f32). i8 (8-bit) is faster still but changes some
   answers.
-  --threads defaults to RAYON_NUM_THREADS, else every logical CPU. One per physical performance
-  core is usually fastest: hyperthreads and slow cores mostly contend for cache and memory.";
+  --threads (for one request at a time) defaults to RAYON_NUM_THREADS, else every logical CPU.
+  One per physical performance core is usually fastest: hyperthreads and slow cores mostly
+  contend for cache and memory, and a slow core holds up every step.
+  --workers (requests run at once, each on one thread, when several are waiting) defaults to
+  --threads. Here efficiency cores do help: on a Core Ultra 7 185H, --threads 6 --workers 14 on
+  the 6 performance + 8 efficiency cores gave 25-33% more throughput than the performance cores
+  alone, while a lone request took ~14% longer (its threads sometimes land on slow cores).";
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -40,6 +45,7 @@ fn main() -> color_eyre::Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().ok_or_else(|| eyre!(USAGE))?);
     let (mut max_length, mut head_length, mut threads) = (None, DEFAULT_HEAD_LENGTH, 0);
+    let mut workers = None;
     let mut precision = Precision::F32;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| eyre!(USAGE))?;
@@ -48,6 +54,7 @@ fn main() -> color_eyre::Result<()> {
             "--max-length" => max_length = Some(number()?),
             "--head-length" => head_length = number()?,
             "--threads" => threads = number()?,
+            "--workers" => workers = Some(number()?),
             "--precision" => precision = value.parse().wrap_err(USAGE)?,
             _ => bail!(USAGE),
         }
@@ -90,7 +97,7 @@ fn main() -> color_eyre::Result<()> {
         Ok(result.to_string())
     };
 
-    // One worker per thread. A request that is alone (nothing queued or running) spreads its
+    // `workers` workers. A request that is alone (nothing queued or running) spreads its
     // steps over the shared pool for low latency; otherwise each worker runs its request on a
     // private 1-thread pool, since whole requests in parallel beat sharing one pool (~20% more
     // throughput). A writer puts results back in input order and stops at the first error.
@@ -110,7 +117,7 @@ fn main() -> color_eyre::Result<()> {
             }
             Ok(())
         });
-        for _ in 0..shared.current_num_threads() {
+        for _ in 0..workers.unwrap_or(shared.current_num_threads()) {
             let (out_tx, job_rx, queued, running, shared, run) =
                 (out_tx.clone(), &job_rx, &queued, &running, &shared, &run);
             ts.spawn(move || {
