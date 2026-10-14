@@ -5,8 +5,8 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::{
-    Model,
-    attn::{Scratch, attention, attention_q},
+    HeadLinears, Model,
+    attn::{Scratch, attention_q},
     f32_vec_add, layernorm,
     matmul::linear,
     mlp::gelu_inplace,
@@ -89,10 +89,11 @@ impl Model {
         };
 
         let (mut h, mut o) = (vec![0f32; n * d], vec![0f32; n * d]);
-        let mut qkv = vec![0f32; n * 3 * d];
+        let mut kv = vec![0f32; n * 2 * d];
         let mut f = vec![0f32; n * ff];
         let mut s = Scratch::default();
-        for (i, l) in dense.iter().enumerate() {
+        let packed = &self.packed.head;
+        for (i, (l, p)) in dense.iter().zip(packed).enumerate() {
             norm_rows(
                 &x,
                 Some(l.norm1_w.as_f32(data)),
@@ -100,29 +101,18 @@ impl Model {
                 TORCH_LN_EPS,
                 &mut h,
             );
-            linear(
-                &h,
-                l.in_proj_w.as_f32(data),
-                Some(l.in_proj_b.as_f32(data)),
-                d,
-                &mut qkv,
-            );
-            attention(&qkv, n, d, None, &mut o, &mut s);
-            linear(
-                &o,
-                l.out_proj_w.as_f32(data),
-                Some(l.out_proj_b.as_f32(data)),
-                d,
-                &mut h,
-            );
-            f32_vec_add(&mut x, &h);
-            self.head_mlp(l, &mut x, &mut h, &mut f);
+            let (bq, bkv) = l.in_proj_b.as_f32(data).split_at(d);
+            linear(&h, &p.q, Some(bq), &mut o);
+            linear(&h, &p.kv, Some(bkv), &mut kv);
+            attention_q(&o, d, &kv, 2 * d, n, d, None, &mut h, &mut s);
+            linear(&h, &p.out_proj, Some(l.out_proj_b.as_f32(data)), &mut o);
+            f32_vec_add(&mut x, &o);
+            self.head_mlp(l, p, &mut x, &mut h, &mut f);
             tap(&format!("head{i}"), &x);
         }
 
         // Last layer: K and V from every row, everything else for the marker rows only.
-        // in_proj is [q | k | v] rows, so splitting at d rows gives Wq and W[k|v].
-        let l = last;
+        let (l, p) = (last, &packed[dense.len()]);
         norm_rows(
             &x,
             Some(l.norm1_w.as_f32(data)),
@@ -130,33 +120,32 @@ impl Model {
             TORCH_LN_EPS,
             &mut h,
         );
-        let (wq, wkv) = l.in_proj_w.as_f32(data).split_at(d * d);
         let (bq, bkv) = l.in_proj_b.as_f32(data).split_at(d);
-        let kv = &mut qkv[..n * 2 * d];
-        linear(&h, wkv, Some(bkv), d, kv);
+        linear(&h, &p.kv, Some(bkv), &mut kv);
         let q = &mut o[..k * d];
-        linear(&gather(&h, markers, d), wq, Some(bq), d, q);
+        linear(&gather(&h, markers, d), &p.q, Some(bq), q);
         let a = &mut h[..k * d];
-        attention_q(q, d, kv, 2 * d, n, d, None, a, &mut s);
+        attention_q(q, d, &kv, 2 * d, n, d, None, a, &mut s);
         let mut xs = gather(&x, markers, d);
-        let p = &mut o[..k * d];
-        linear(
-            a,
-            l.out_proj_w.as_f32(data),
-            Some(l.out_proj_b.as_f32(data)),
-            d,
-            p,
-        );
-        f32_vec_add(&mut xs, p);
-        self.head_mlp(l, &mut xs, &mut h[..k * d], &mut f[..k * ff]);
+        let po = &mut o[..k * d];
+        linear(a, &p.out_proj, Some(l.out_proj_b.as_f32(data)), po);
+        f32_vec_add(&mut xs, po);
+        self.head_mlp(l, p, &mut xs, &mut h[..k * d], &mut f[..k * ff]);
         tap(&format!("head{}", dense.len()), &xs);
 
         self.score(xs)
     }
 
     /// x += linear2(ReLU(linear1(norm2(x)))). `h` is `[rows, d]` and `f` `[rows, head_ff]` scratch.
-    fn head_mlp(&self, l: &HeadLayer, x: &mut [f32], h: &mut [f32], f: &mut [f32]) {
-        let (data, d, ff) = (self.data(), self.config.hidden, self.config.head_ff);
+    fn head_mlp(
+        &self,
+        l: &HeadLayer,
+        p: &HeadLinears,
+        x: &mut [f32],
+        h: &mut [f32],
+        f: &mut [f32],
+    ) {
+        let data = self.data();
         norm_rows(
             x,
             Some(l.norm2_w.as_f32(data)),
@@ -164,13 +153,7 @@ impl Model {
             TORCH_LN_EPS,
             h,
         );
-        linear(
-            h,
-            l.linear1_w.as_f32(data),
-            Some(l.linear1_b.as_f32(data)),
-            d,
-            f,
-        );
+        linear(h, &p.linear1, Some(l.linear1_b.as_f32(data)), f);
         f.par_chunks_mut(4096).for_each(|f| {
             for v in f {
                 // not f32::max, whose NaN handling stops it compiling to a plain vmaxps
@@ -179,13 +162,7 @@ impl Model {
                 }
             }
         });
-        linear(
-            f,
-            l.linear2_w.as_f32(data),
-            Some(l.linear2_b.as_f32(data)),
-            ff,
-            h,
-        );
+        linear(f, &p.linear2, Some(l.linear2_b.as_f32(data)), h);
         f32_vec_add(x, h);
     }
 
@@ -196,23 +173,12 @@ impl Model {
         for row in z.chunks_exact_mut(d) {
             layernorm(row, nw, Some(nb), TORCH_LN_EPS);
         }
+        let [lin1, lin2] = &self.packed.scorer;
         let mut y = vec![0f32; z.len()];
-        linear(
-            &z,
-            sc.lin1_w.as_f32(data),
-            Some(sc.lin1_b.as_f32(data)),
-            d,
-            &mut y,
-        );
+        linear(&z, lin1, Some(sc.lin1_b.as_f32(data)), &mut y);
         gelu_inplace(&mut y);
         let mut logits = vec![0f32; z.len() / d];
-        linear(
-            &y,
-            sc.lin2_w.as_f32(data),
-            Some(sc.lin2_b.as_f32(data)),
-            d,
-            &mut logits,
-        );
+        linear(&y, lin2, Some(sc.lin2_b.as_f32(data)), &mut logits);
         logits
     }
 }

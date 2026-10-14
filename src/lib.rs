@@ -27,7 +27,7 @@ use tokenizer::Tokenizer;
 
 use crate::{
     attn::{Rope, Scratch, attention},
-    matmul::linear,
+    matmul::{Packed, linear},
     mlp::geglu,
 };
 
@@ -38,7 +38,62 @@ pub struct Model {
     pub data_start: usize,
     pub config: ModelConfig,
     pub weights: Weights,
+    /// Every linear weight, packed for `matmul::linear` at load time.
+    pub packed: PackedWeights,
     pub tokenizer: Tokenizer,
+}
+
+pub struct EncoderLinears {
+    pub wqkv: Packed,
+    pub wo: Packed,
+    pub wi: Packed,
+    pub wo_mlp: Packed,
+}
+
+/// `in_proj` is split into its q rows and k|v rows, so the head can compute queries for a
+/// subset of rows (`attention_q`).
+pub struct HeadLinears {
+    pub q: Packed,
+    pub kv: Packed,
+    pub out_proj: Packed,
+    pub linear1: Packed,
+    pub linear2: Packed,
+}
+
+pub struct PackedWeights {
+    pub encoder: Vec<EncoderLinears>,
+    pub head: Vec<HeadLinears>,
+    pub scorer: [Packed; 2],
+}
+
+impl PackedWeights {
+    fn new(w: &Weights, data: &[u8], cfg: &ModelConfig) -> Self {
+        let (d, inter, ff) = (cfg.hidden, cfg.intermediate, cfg.head_ff);
+        let p = |t: &safetensors::Tensor, inp: usize| Packed::new(t.as_f32(data), inp);
+        Self {
+            encoder: (w.encoder.layers.iter())
+                .map(|l| EncoderLinears {
+                    wqkv: p(&l.wqkv, d),
+                    wo: p(&l.wo, d),
+                    wi: p(&l.wi, d),
+                    wo_mlp: p(&l.wo_mlp, inter),
+                })
+                .collect(),
+            head: (w.head.iter())
+                .map(|l| {
+                    let (q, kv) = l.in_proj_w.as_f32(data).split_at(d * d);
+                    HeadLinears {
+                        q: Packed::new(q, d),
+                        kv: Packed::new(kv, d),
+                        out_proj: p(&l.out_proj_w, d),
+                        linear1: p(&l.linear1_w, d),
+                        linear2: p(&l.linear2_w, ff),
+                    }
+                })
+                .collect(),
+            scorer: [p(&w.scorer.lin1_w, d), p(&w.scorer.lin2_w, d)],
+        }
+    }
 }
 
 impl Model {
@@ -79,7 +134,14 @@ impl Model {
         let rope_l = Rope::new(self.config.rope_theta_local, n);
 
         let data = self.data();
-        for (i, l) in self.weights.encoder.layers.iter().enumerate() {
+        for (i, (l, p)) in self
+            .weights
+            .encoder
+            .layers
+            .iter()
+            .zip(&self.packed.encoder)
+            .enumerate()
+        {
             // attention
             norm_rows(
                 &x,
@@ -88,7 +150,7 @@ impl Model {
                 eps,
                 &mut h,
             );
-            linear(&h, l.wqkv.as_f32(data), None, d, &mut qkv);
+            linear(&h, &p.wqkv, None, &mut qkv);
             let (rope, window) = if l.global {
                 (&rope_g, None)
             } else {
@@ -96,14 +158,14 @@ impl Model {
             };
             rope.apply(&mut qkv, d);
             attention(&qkv, n, d, window, &mut o, &mut s);
-            linear(&o, l.wo.as_f32(data), None, d, &mut h);
+            linear(&o, &p.wo, None, &mut h);
             f32_vec_add(&mut x, &h);
 
             // MLP
             norm_rows(&x, Some(l.mlp_norm.as_f32(data)), None, eps, &mut h);
-            linear(&h, l.wi.as_f32(data), None, d, &mut hh);
+            linear(&h, &p.wi, None, &mut hh);
             geglu(&hh, inter, &mut m);
-            linear(&m, l.wo_mlp.as_f32(data), None, inter, &mut h);
+            linear(&m, &p.wo_mlp, None, &mut h);
             f32_vec_add(&mut x, &h);
 
             tap(&format!("layer{i:02}"), &x);
@@ -219,6 +281,7 @@ pub fn load_model(paths: ModelPaths<'_>) -> color_eyre::Result<Model> {
         bail!("model.safetensors header length {len} exceeds file size");
     };
     let weights = safetensors::parse_header(header, map.len() - data_start, &config)?;
+    let packed = PackedWeights::new(&weights, &map[data_start..], &config);
     let tokenizer = Tokenizer::load(paths.tokenizer_json_path, paths.tokenizer_config_json_path)?;
     ensure!(
         tokenizer.vocab_size == config.vocab,
@@ -233,6 +296,7 @@ pub fn load_model(paths: ModelPaths<'_>) -> color_eyre::Result<Model> {
         data_start,
         config,
         weights,
+        packed,
         tokenizer,
     })
 }
