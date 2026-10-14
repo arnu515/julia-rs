@@ -3,12 +3,13 @@
 
 use std::{
     fs::File,
+    ops::Range,
     path::Path,
     simd::{StdFloat, f32x8, num::SimdFloat},
 };
 
 use color_eyre::eyre::{bail, ensure};
-use memmap2::Mmap;
+use memmap2::{Mmap, UncheckedAdvice};
 use rayon::prelude::*;
 
 pub mod attn;
@@ -67,9 +68,24 @@ pub struct PackedWeights {
 }
 
 impl PackedWeights {
-    fn new(w: &Weights, data: &[u8], cfg: &ModelConfig, precision: Precision) -> Self {
+    /// Packs every linear weight of `w` (in `map`'s data section, from `data_start`), then drops
+    /// the original's pages from memory.
+    fn new(
+        w: &Weights,
+        map: &Mmap,
+        data_start: usize,
+        cfg: &ModelConfig,
+        precision: Precision,
+    ) -> Self {
         let (d, inter, ff) = (cfg.hidden, cfg.intermediate, cfg.head_ff);
-        let p = |t: &safetensors::Tensor, inp: usize| Packed::new(t.as_f32(data), inp, precision);
+        let data = &map[data_start..];
+        let release =
+            |t: &safetensors::Tensor| release(map, data_start + t.start..data_start + t.end);
+        let p = |t: &safetensors::Tensor, inp: usize| {
+            let packed = Packed::new(t.as_f32(data), inp, precision);
+            release(t);
+            packed
+        };
         Self {
             encoder: (w.encoder.layers.iter())
                 .map(|l| EncoderLinears {
@@ -82,9 +98,11 @@ impl PackedWeights {
             head: (w.head.iter())
                 .map(|l| {
                     let (q, kv) = l.in_proj_w.as_f32(data).split_at(d * d);
+                    let (q, kv) = (Packed::new(q, d, precision), Packed::new(kv, d, precision));
+                    release(&l.in_proj_w);
                     HeadLinears {
-                        q: Packed::new(q, d, precision),
-                        kv: Packed::new(kv, d, precision),
+                        q,
+                        kv,
                         out_proj: p(&l.out_proj_w, d),
                         linear1: p(&l.linear1_w, d),
                         linear2: p(&l.linear2_w, ff),
@@ -93,6 +111,19 @@ impl PackedWeights {
                 .collect(),
             scorer: [p(&w.scorer.lin1_w, d), p(&w.scorer.lin2_w, d)],
         }
+    }
+}
+
+/// Drops the resident pages wholly inside `range` of `map`, a weight already packed. The map is a
+/// read-only file mapping, so anything touching them again rereads the file. (Peak memory after
+/// loading: 483 -> 305 MB in f32, 350 -> 171 MB in i8.)
+fn release(map: &Mmap, range: Range<usize>) {
+    const PAGE: usize = 4096;
+    let (a, b) = (range.start.next_multiple_of(PAGE), range.end / PAGE * PAGE);
+    if a < b {
+        // SAFETY: a shared read-only file mapping reads back unchanged after MADV_DONTNEED. Best
+        // effort: errors (larger pages, say) just leave the pages resident.
+        let _ = unsafe { map.unchecked_advise_range(UncheckedAdvice::DontNeed, a, b - a) };
     }
 }
 
@@ -280,7 +311,7 @@ pub fn load_model(paths: ModelPaths<'_>, precision: Precision) -> color_eyre::Re
         bail!("model.safetensors header length {len} exceeds file size");
     };
     let weights = safetensors::parse_header(header, map.len() - data_start, &config)?;
-    let packed = PackedWeights::new(&weights, &map[data_start..], &config, precision);
+    let packed = PackedWeights::new(&weights, &map, data_start, &config, precision);
     let tokenizer = Tokenizer::load(paths.tokenizer_json_path, paths.tokenizer_config_json_path)?;
     ensure!(
         tokenizer.vocab_size == config.vocab,
