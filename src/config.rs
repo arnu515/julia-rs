@@ -27,6 +27,8 @@ pub struct ModelConfig {
     pub rope_theta_global: f32,
     pub rope_theta_local: f32,
     pub norm_eps: f32,
+    /// Longest sequence the encoder was trained for (`max_position_embeddings`).
+    pub max_positions: usize,
 
     pub head_layers: usize,
     /// Head `nn.TransformerEncoderLayer(width, max(1, width // 64), 4 * width)` in `julia/model.py`.
@@ -45,6 +47,7 @@ struct EncoderJson {
     local_attention: usize,
     rope_parameters: RopeJson,
     norm_eps: f32,
+    max_position_embeddings: usize,
     norm_bias: bool,
     attention_bias: bool,
     mlp_bias: bool,
@@ -116,6 +119,7 @@ impl ModelConfig {
             rope_theta_global: enc.rope_parameters.full_attention.rope_theta,
             rope_theta_local: enc.rope_parameters.sliding_attention.rope_theta,
             norm_eps: enc.norm_eps,
+            max_positions: enc.max_position_embeddings,
             head_layers: julia.head_layers,
             head_heads,
             head_ff: 4 * enc.hidden_size,

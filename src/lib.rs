@@ -16,6 +16,7 @@ pub mod head;
 pub mod matmul;
 pub mod mlp;
 pub mod safetensors;
+pub mod sequence;
 pub mod tokenizer;
 
 use config::ModelConfig;

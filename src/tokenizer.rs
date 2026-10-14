@@ -37,6 +37,8 @@ pub struct Tokenizer {
     added: Vec<Vec<AddedToken>>,
     space_id: u32,
     pub special: SpecialIds,
+    /// Text of the mask token (`<mask>`), which Julia removes from user text.
+    pub mask_token: Box<str>,
     /// Number of ids (max vocab id + 1).
     pub vocab_size: usize,
 }
@@ -155,6 +157,7 @@ impl Tokenizer {
             space_id,
             vocab_size,
             special,
+            mask_token: config.mask_token.into(),
         })
     }
 
