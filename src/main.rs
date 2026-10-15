@@ -53,8 +53,15 @@ const USAGE: &str = "usage: julia-rs <checkpoint dir> [--max-length N] [--head-l
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    if !arch::is_x86_feature_detected!("avxvnni") {
-        panic!("AVX-VNNI is required to run this program");
+    // The crate is compiled for these (.cargo/config.toml); AVX-VNNI is checked per precision.
+    let features = [
+        arch::is_x86_feature_detected!("avx2"),
+        arch::is_x86_feature_detected!("fma"),
+        arch::is_x86_feature_detected!("f16c"),
+        arch::is_x86_feature_detected!("bmi2"),
+    ];
+    if features.contains(&false) {
+        bail!("julia-rs needs a CPU with AVX2, FMA, F16C and BMI2");
     }
 
     let mut args = std::env::args().skip(1);

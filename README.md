@@ -5,9 +5,11 @@ Rust with hand-written AVX2 / AVX-VNNI kernels. Runs in fp32, int16, or int8 pre
 
 ## Requirements
 
-- An x86-64 CPU with **AVX2, FMA and AVX-VNNI** (Intel Alder Lake / Meteor Lake or newer, AMD Zen 5
-  or newer). The binary checks for AVX-VNNI at startup.
-  - Please feel free to open a pull-request with other combinations (e.g. AVX-512, AVX2 + FMA, no VNNI, etc.)
+- An x86-64 CPU with **AVX2 and FMA** (and F16C, BMI2: Intel Haswell / AMD Zen or newer).
+  - `--precision i16` and `i8` also need **AVX-VNNI** (Intel Alder Lake / Meteor Lake or newer, AMD
+    Zen 5 or newer). Their kernels enable it per function and are only used once a run-time check
+    finds it; elsewhere those modes report an error, and `f32` works.
+  - Please feel free to open a pull-request with other combinations (e.g. AVX-512).
 - Linux (tested). Other Unix-likes should work; the memory release after packing is best effort.
 - Rust nightly (pinned in `rust-toolchain.toml`).
 - These files downloaded from the Julia-1 HF repo: `model.safetensors`, `julia_config.json`,
@@ -19,8 +21,8 @@ Rust with hand-written AVX2 / AVX-VNNI kernels. Runs in fp32, int16, or int8 pre
 cargo build --release
 ```
 
-`.cargo/config.toml` enables `avx2,fma,avxvnni,f16c,bmi2` for the whole crate, so the binary only
-runs on CPUs that have them.
+`.cargo/config.toml` enables `avx2,fma,f16c,bmi2` for the whole crate, so the binary only runs on
+CPUs that have them (it checks at startup).
 
 ## Usage
 

@@ -13,8 +13,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! y = x·Wᵀ + b with W packed once at load time for a 6×16 register-tile kernel, in f32 or in
-//! integers (AVX-VNNI).
+//! y = x·Wᵀ + b with W packed once at load time for a 6×16 register-tile kernel, in f32 (AVX2 +
+//! FMA) or in integers (AVX-VNNI, detected at run time).
 
 use std::{
     arch::{
@@ -77,6 +77,13 @@ pub enum Precision {
     I8,
 }
 
+impl Precision {
+    /// Whether this CPU can run it: the integer modes need AVX-VNNI.
+    pub fn available(self) -> bool {
+        self == Self::F32 || std::arch::is_x86_feature_detected!("avxvnni")
+    }
+}
+
 impl FromStr for Precision {
     type Err = color_eyre::Report;
     fn from_str(s: &str) -> color_eyre::Result<Self> {
@@ -120,6 +127,11 @@ impl Packed {
     /// Packs `w` (`[out, inp]`, row-major as in PyTorch), in parallel over panels.
     pub fn new(w: &[f32], inp: usize, precision: Precision) -> Self {
         let out = w.len() / inp;
+        // The integer kernels' safety rests on this.
+        assert!(
+            precision.available(),
+            "Packed: {precision:?} needs AVX-VNNI"
+        );
         assert!(
             inp > 0 && w.len() == out * inp,
             "Packed: {} weights are not [_, {inp}]",
@@ -330,30 +342,60 @@ fn linear_into(x: &[f32], w: &Packed, b: Option<&[f32]>, y: &mut [f32], add: boo
                 _ => store(tile_f32::<1>(x, panel, t), out, b, y, t, j),
             }
         }),
-        Panels::I16 { panels, scale } => {
-            let (xq, sx) = quantize_i16(x, inp);
-            let kp = inp.div_ceil(2);
-            tiles(n, out, |t, m, j| {
-                let (panel, sw) = (&panels[j / NR * kp..][..kp], &scale[j..][..NR]);
-                match m {
-                    MR => store(tile_i16::<MR>(&xq, panel, &sx, sw, t), out, b, y, t, j),
-                    _ => store(tile_i16::<1>(&xq, panel, &sx, sw, t), out, b, y, t, j),
-                }
-            })
-        }
-        Panels::I8 { panels, scale, sum } => {
-            let (xq, sx, zx) = quantize_u8(x, inp);
-            let kq = inp.div_ceil(4);
-            tiles(n, out, |t, m, j| {
-                let panel = &panels[j / NR * kq..][..kq];
-                let w = (panel, &scale[j..][..NR], &sum[j..][..NR]);
-                match m {
-                    MR => store(tile_i8::<MR>(&xq, &sx, &zx, w, t), out, b, y, t, j),
-                    _ => store(tile_i8::<1>(&xq, &sx, &zx, w, t), out, b, y, t, j),
-                }
-            })
-        }
+        // SAFETY: integer panels exist only on CPUs with AVX-VNNI (checked in `Packed::new`).
+        Panels::I16 { panels, scale } => unsafe { linear_i16(x, inp, out, panels, scale, b, y) },
+        Panels::I8 { panels, scale, sum } => unsafe {
+            linear_i8(x, inp, out, panels, (scale, sum), b, y)
+        },
     }
+}
+
+/// [`linear_into`] for i16 panels. A separate AVX-VNNI function, so that the per-tile closure
+/// inherits the feature and inlines [`tile_i16`].
+#[target_feature(enable = "avxvnni")]
+fn linear_i16(
+    x: &[f32],
+    inp: usize,
+    out: usize,
+    panels: &[[i16; 2 * NR]],
+    scale: &[f32],
+    b: Option<&[f32]>,
+    y: Out,
+) {
+    let n = x.len() / inp;
+    let (xq, sx) = quantize_i16(x, inp);
+    let kp = inp.div_ceil(2);
+    tiles(n, out, |t, m, j| {
+        let (panel, sw) = (&panels[j / NR * kp..][..kp], &scale[j..][..NR]);
+        match m {
+            MR => store(tile_i16::<MR>(&xq, panel, &sx, sw, t), out, b, y, t, j),
+            _ => store(tile_i16::<1>(&xq, panel, &sx, sw, t), out, b, y, t, j),
+        }
+    })
+}
+
+/// [`linear_into`] for i8 panels (with their output scales and weight sums), like [`linear_i16`].
+#[target_feature(enable = "avxvnni")]
+fn linear_i8(
+    x: &[f32],
+    inp: usize,
+    out: usize,
+    panels: &[[i8; 4 * NR]],
+    (scale, sum): (&[f32], &[i32]),
+    b: Option<&[f32]>,
+    y: Out,
+) {
+    let n = x.len() / inp;
+    let (xq, sx, zx) = quantize_u8(x, inp);
+    let kq = inp.div_ceil(4);
+    tiles(n, out, |t, m, j| {
+        let panel = &panels[j / NR * kq..][..kq];
+        let w = (panel, &scale[j..][..NR], &sum[j..][..NR]);
+        match m {
+            MR => store(tile_i8::<MR>(&xq, &sx, &zx, w, t), out, b, y, t, j),
+            _ => store(tile_i8::<1>(&xq, &sx, &zx, w, t), out, b, y, t, j),
+        }
+    })
 }
 
 /// Runs `tile(t, m, j)` for every `m`-token (`MR` or 1) × 16-output tile of an `[n, out]` result,
@@ -404,7 +446,7 @@ fn tile_f32<const M: usize>(x: &[f32], panel: &[[f32; NR]], t: usize) -> [[f32x8
 
 /// [`tile_f32`] on 13-bit integers: `x` holds packed input pairs and `sx` the token scales, `sw`
 /// the panel's output scales.
-#[inline(always)]
+#[target_feature(enable = "avxvnni")]
 fn tile_i16<const M: usize>(
     x: &[i32],
     panel: &[[i16; 2 * NR]],
@@ -412,11 +454,19 @@ fn tile_i16<const M: usize>(
     sw: &[f32],
     t: usize,
 ) -> [[f32x8; 2]; M] {
+    // Loops rather than `array::from_fn`, whose closures (AVX-VNNI, like this function) can't be
+    // inlined into it (std, compiled without) and became a call per block.
     let kp = panel.len();
-    let xr: [&[i32]; M] = std::array::from_fn(|r| &x[(t + r) * kp..][..kp]);
+    let mut xr = [&x[..0]; M];
+    for (r, xr) in xr.iter_mut().enumerate() {
+        *xr = &x[(t + r) * kp..][..kp];
+    }
     let mut sum = [[f32x8::splat(0.0); 2]; M];
     for (kb, panel) in panel.chunks(KP16).enumerate() {
-        let xb: [&[i32]; M] = std::array::from_fn(|r| &xr[r][kb * KP16..][..panel.len()]);
+        let mut xb = xr;
+        for xb in &mut xb {
+            *xb = &xb[kb * KP16..][..panel.len()];
+        }
         let mut acc = [[__m256i::from(i32x8::splat(0)); 2]; M];
         for (k, w) in panel.iter().enumerate() {
             let w0 = __m256i::from(i16x16::from_slice(&w[..NR]));
@@ -443,7 +493,7 @@ fn tile_i16<const M: usize>(
 
 /// [`tile_f32`] on u8 activations (`x` packed in quads, `sx` scales, `zx` zero points) and one i8
 /// panel (with its output scales and weight sums).
-#[inline(always)]
+#[target_feature(enable = "avxvnni")]
 fn tile_i8<const M: usize>(
     x: &[i32],
     sx: &[f32],
@@ -451,8 +501,12 @@ fn tile_i8<const M: usize>(
     (panel, sw, sum): (&[[i8; 4 * NR]], &[f32], &[i32]),
     t: usize,
 ) -> [[f32x8; 2]; M] {
+    // Loops rather than `array::from_fn`, as in `tile_i16`.
     let kq = panel.len();
-    let xr: [&[i32]; M] = std::array::from_fn(|r| &x[(t + r) * kq..][..kq]);
+    let mut xr = [&x[..0]; M];
+    for (r, xr) in xr.iter_mut().enumerate() {
+        *xr = &x[(t + r) * kq..][..kq];
+    }
     let mut acc = [[__m256i::from(i32x8::splat(0)); 2]; M];
     for (k, w) in panel.iter().enumerate() {
         let w0 = __m256i::from(i8x32::from_slice(&w[..2 * NR]));
@@ -466,11 +520,13 @@ fn tile_i8<const M: usize>(
     // Σ (u - z)·w = Σ u·w - z·Σ w, exactly in i32; then scale.
     let (c0, c1) = (i32x8::from_slice(&sum[..8]), i32x8::from_slice(&sum[8..]));
     let (s0, s1) = (f32x8::from_slice(&sw[..8]), f32x8::from_slice(&sw[8..]));
-    std::array::from_fn(|r| {
+    let mut res = [[f32x8::splat(0.0); 2]; M];
+    for (r, (res, acc)) in res.iter_mut().zip(acc).enumerate() {
         let (z, s) = (i32x8::splat(zx[t + r]), f32x8::splat(sx[t + r]));
         let a = |acc: __m256i, c: i32x8| (i32x8::from(acc) - z * c).cast::<f32>();
-        [a(acc[r][0], c0) * (s * s0), a(acc[r][1], c1) * (s * s1)]
-    })
+        *res = [a(acc[0], c0) * (s * s0), a(acc[1], c1) * (s * s1)];
+    }
+    res
 }
 
 /// a and b rounded to the nearest integers (ties to even), in order. Values must fit i16.
@@ -499,11 +555,12 @@ fn to_u8(v: [f32x8; 4]) -> [u8; 32] {
 }
 
 /// acc + Σ adjacent i16 pairs of a·b, per i32 lane.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avxvnni")]
 fn dpwssd(mut acc: __m256i, a: __m256i, b: __m256i) -> __m256i {
     // Inline asm, since LLVM splits `_mm256_dpwssd_avx_epi32` into vpmaddwd + vpaddd, two µops
     // instead of one, which halved the kernel's speed.
-    // SAFETY: the crate is built with AVX-VNNI (.cargo/config.toml), and `main` checks for it.
+    // SAFETY: AVX-VNNI is enabled for this function.
     unsafe {
         asm!(
             "{{vex}} vpdpwssd {acc}, {a}, {b}",
@@ -517,10 +574,11 @@ fn dpwssd(mut acc: __m256i, a: __m256i, b: __m256i) -> __m256i {
 }
 
 /// acc + Σ groups of 4 u8 a × i8 b, per i32 lane.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avxvnni")]
 fn dpbusd(mut acc: __m256i, a: __m256i, b: __m256i) -> __m256i {
     // Inline asm for the same reason as `dpwssd`.
-    // SAFETY: the crate is built with AVX-VNNI (.cargo/config.toml), and `main` checks for it.
+    // SAFETY: AVX-VNNI is enabled for this function.
     unsafe {
         asm!(
             "{{vex}} vpdpbusd {acc}, {a}, {b}",

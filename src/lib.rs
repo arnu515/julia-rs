@@ -302,6 +302,9 @@ pub struct ModelPaths<'a> {
 
 /// Loads a checkpoint, packing its linear weights in `precision`.
 pub fn load_model(paths: ModelPaths<'_>, precision: Precision) -> color_eyre::Result<Model> {
+    if !precision.available() {
+        bail!("{precision:?} precision needs AVX-VNNI, which this CPU lacks (f32 works)");
+    }
     let config = ModelConfig::load(paths.encoder_config_json_path, paths.julia_config_json_path)?;
 
     let file = File::open(paths.safetensors_path)?;
