@@ -149,7 +149,13 @@ pub fn sequence(
 
 /// Python's `json.dumps(v, ensure_ascii=False)`: `", "` and `": "` separators, keys in input
 /// order, `repr` floats. (Integers beyond 64 bits reach here as floats; Python keeps them exact.)
-fn python_json(v: &Value, out: &mut String) {
+pub fn python_json(v: &Value) -> String {
+    let mut out = String::new();
+    write_python_json(v, &mut out);
+    out
+}
+
+fn write_python_json(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -164,7 +170,7 @@ fn python_json(v: &Value, out: &mut String) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                python_json(x, out);
+                write_python_json(x, out);
             }
             out.push(']');
         }
@@ -176,7 +182,7 @@ fn python_json(v: &Value, out: &mut String) {
                 }
                 python_str(k, out);
                 out.push_str(": ");
-                python_json(x, out);
+                write_python_json(x, out);
             }
             out.push('}');
         }
@@ -296,8 +302,7 @@ mod tests {
                 "a": {"s": "q\"\\\n\t\u0001é😀", "e": [], "o": {}, "n": null, "t": true}}"#,
         )
         .unwrap();
-        let mut s = String::new();
-        python_json(&v, &mut s);
+        let s = python_json(&v);
         // json.dumps(json.loads(same text), ensure_ascii=False)
         let want = r#"{"b": [1, -2, 3.0, 0.1, 1e+16, 1.5e-07, 0.0001, -0.0, 123456789.125, -1541722455959009.2, 18446744073709551615], "a": {"s": "q\"\\\n\t\u0001é😀", "e": [], "o": {}, "n": null, "t": true}}"#;
         assert_eq!(s, want);
