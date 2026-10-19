@@ -23,7 +23,7 @@ use std::{
     simd::{StdFloat, f32x8, num::SimdFloat},
 };
 
-use color_eyre::eyre::{bail, ensure};
+use eyre::{bail, ensure};
 use memmap2::{Mmap, UncheckedAdvice};
 use rayon::prelude::*;
 
@@ -301,7 +301,7 @@ pub struct ModelPaths<'a> {
 }
 
 /// Loads a checkpoint, packing its linear weights in `precision`.
-pub fn load_model(paths: ModelPaths<'_>, precision: Precision) -> color_eyre::Result<Model> {
+pub fn load_model(paths: ModelPaths<'_>, precision: Precision) -> eyre::Result<Model> {
     if !precision.available() {
         bail!("{precision:?} precision needs AVX-VNNI, which this CPU lacks (f32 works)");
     }

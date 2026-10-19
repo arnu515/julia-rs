@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use color_eyre::eyre::{bail, ensure, eyre};
+use eyre::{bail, ensure, eyre};
 use serde::Deserialize;
 
 use crate::config::{ModelConfig, N_QTYPES};
@@ -111,7 +111,7 @@ struct Header<'a> {
 
 /// `data_len` is the size of the data section (file length - 8 - header length).
 /// Every tensor's shape is checked against the dimensions in `cfg`.
-pub fn parse_header(raw: &[u8], data_len: usize, cfg: &ModelConfig) -> color_eyre::Result<Weights> {
+pub fn parse_header(raw: &[u8], data_len: usize, cfg: &ModelConfig) -> eyre::Result<Weights> {
     let header: Header = serde_json::from_slice(raw)?;
     let d = cfg.hidden;
 
@@ -125,7 +125,7 @@ pub fn parse_header(raw: &[u8], data_len: usize, cfg: &ModelConfig) -> color_eyr
         );
     }
 
-    let get = |name: &str, shape: &[usize]| -> color_eyre::Result<Tensor> {
+    let get = |name: &str, shape: &[usize]| -> eyre::Result<Tensor> {
         let t = header
             .tensors
             .get(name)
@@ -149,7 +149,7 @@ pub fn parse_header(raw: &[u8], data_len: usize, cfg: &ModelConfig) -> color_eyr
         Ok(Tensor { start, end })
     };
 
-    let enc_layer = |i: usize| -> color_eyre::Result<EncoderLayer> {
+    let enc_layer = |i: usize| -> eyre::Result<EncoderLayer> {
         let p = format!("encoder.layers.{i}.");
         let attn_norm = format!("{p}attn_norm.weight");
         Ok(EncoderLayer {
@@ -167,7 +167,7 @@ pub fn parse_header(raw: &[u8], data_len: usize, cfg: &ModelConfig) -> color_eyr
         })
     };
 
-    let head_layer = |j: usize| -> color_eyre::Result<HeadLayer> {
+    let head_layer = |j: usize| -> eyre::Result<HeadLayer> {
         let p = format!("head.layers.{j}.");
         Ok(HeadLayer {
             in_proj_w: get(&format!("{p}self_attn.in_proj_weight"), &[3 * d, d])?,
@@ -191,13 +191,13 @@ pub fn parse_header(raw: &[u8], data_len: usize, cfg: &ModelConfig) -> color_eyr
             emb_norm: get("encoder.embeddings.norm.weight", &[d])?,
             layers: (0..cfg.n_layers)
                 .map(enc_layer)
-                .collect::<color_eyre::Result<_>>()?,
+                .collect::<eyre::Result<_>>()?,
             final_norm: get("encoder.final_norm.weight", &[d])?,
         },
         type_emb: get("type_emb.weight", &[N_QTYPES, d])?,
         head: (0..cfg.head_layers)
             .map(head_layer)
-            .collect::<color_eyre::Result<_>>()?,
+            .collect::<eyre::Result<_>>()?,
         scorer: Scorer {
             norm_w: get("scorer.0.weight", &[d])?,
             norm_b: get("scorer.0.bias", &[d])?,

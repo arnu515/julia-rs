@@ -164,6 +164,7 @@ name = "julia-rs"
 version = "0.1.0"
 dependencies = [
  "color-eyre",
+ "eyre",
  "memmap2",
  "rayon",
  "serde",

@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use color_eyre::eyre::{bail, ensure};
+use eyre::{bail, ensure};
 use serde::Deserialize;
 
 /// Question types (`choice`, `score`, `noul`). Defined in Julia's code (`QTYPES` in `data.py`),
@@ -87,7 +87,7 @@ struct JuliaJson {
 }
 
 impl ModelConfig {
-    pub fn load(encoder_config_json: &Path, julia_config_json: &Path) -> color_eyre::Result<Self> {
+    pub fn load(encoder_config_json: &Path, julia_config_json: &Path) -> eyre::Result<Self> {
         let enc: EncoderJson =
             serde_json::from_str(&std::fs::read_to_string(encoder_config_json)?)?;
         let julia: JuliaJson = serde_json::from_str(&std::fs::read_to_string(julia_config_json)?)?;
@@ -123,7 +123,7 @@ impl ModelConfig {
                 "sliding_attention" => Ok(false),
                 _ => bail!("unknown layer type `{t}`"),
             })
-            .collect::<color_eyre::Result<_>>()?;
+            .collect::<eyre::Result<_>>()?;
 
         Ok(Self {
             hidden: enc.hidden_size,

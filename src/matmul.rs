@@ -33,7 +33,7 @@ use std::{
     str::FromStr,
 };
 
-use color_eyre::eyre::bail;
+use eyre::bail;
 
 use rayon::prelude::*;
 
@@ -85,8 +85,8 @@ impl Precision {
 }
 
 impl FromStr for Precision {
-    type Err = color_eyre::Report;
-    fn from_str(s: &str) -> color_eyre::Result<Self> {
+    type Err = eyre::Report;
+    fn from_str(s: &str) -> eyre::Result<Self> {
         Ok(match s {
             "f32" => Self::F32,
             "i16" => Self::I16,

@@ -20,7 +20,7 @@
 
 use std::{collections::HashMap, path::Path};
 
-use color_eyre::eyre::{ensure, eyre};
+use eyre::{ensure, eyre};
 use serde::Deserialize;
 
 const SPACE: char = '▁';
@@ -91,7 +91,7 @@ struct ConfigJson {
 }
 
 impl Tokenizer {
-    pub fn load(tokenizer_json: &Path, config_json: &Path) -> color_eyre::Result<Self> {
+    pub fn load(tokenizer_json: &Path, config_json: &Path) -> eyre::Result<Self> {
         let json: TokenizerJson = serde_json::from_str(&std::fs::read_to_string(tokenizer_json)?)?;
         let config: ConfigJson = serde_json::from_str(&std::fs::read_to_string(config_json)?)?;
         let model = json.model;

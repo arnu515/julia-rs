@@ -4,8 +4,20 @@ version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 
+[features]
+default = ["cli"]
+# The julia-rs binary
+cli = ["dep:color-eyre"]
+
+[[bin]]
+name = "julia-rs"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
-color-eyre = "0.6.5"
+# The same crate version color-eyre re-exports.
+eyre = "0.6.12"
+color-eyre = { version = "0.6.5", optional = true }
 memmap2 = "0.9.11"
 rayon = "1.11"
 serde = { version = "1.0.229", features = ["derive"] }

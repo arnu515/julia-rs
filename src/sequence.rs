@@ -20,7 +20,7 @@
 
 use std::{borrow::Cow, fmt::Write};
 
-use color_eyre::eyre::{bail, ensure};
+use eyre::ensure;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -70,7 +70,7 @@ pub fn sequence(
     req: &Request,
     max_length: usize,
     head_length: usize,
-) -> color_eyre::Result<Sequence> {
+) -> eyre::Result<Sequence> {
     ensure!(
         head_length + 4 < max_length,
         "max_length {max_length} must leave room beyond head_length {head_length}"
@@ -263,7 +263,7 @@ impl Model {
         req: &Request,
         max_length: usize,
         head_length: usize,
-    ) -> color_eyre::Result<Prediction> {
+    ) -> eyre::Result<Prediction> {
         ensure!(
             max_length <= self.config.max_positions,
             "max_length {max_length} is over the model's {}",
