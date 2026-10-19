@@ -18,10 +18,19 @@
 //!
 //! `[CLS] {type} question: {question} [SEP] <mask> option… <mask> option… [SEP] {state} [SEP]`
 
-use std::{borrow::Cow, fmt::Write};
+use std::{
+    borrow::Cow,
+    fmt::{self, Write},
+};
 
 use eyre::ensure;
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{
+        MapAccess, SeqAccess, Visitor,
+        value::{MapAccessDeserializer, SeqAccessDeserializer},
+    },
+};
 use serde_json::Value;
 
 use crate::{
@@ -44,15 +53,56 @@ const MIN_OPTION: isize = 4;
 const MIN_QUESTION: isize = 8;
 
 /// One question about a state: a row of Julia's JSONL. Other fields (`target`, …) are ignored.
-#[derive(Deserialize)]
-pub struct Request {
-    /// Text, or a JSON object/array, which is rendered like Python's
-    /// `json.dumps(state, ensure_ascii=False)`.
-    pub state: Value,
-    pub question: String,
+/// Deserializing borrows from the input where it can (strings without escapes).
+#[derive(Debug, Deserialize)]
+pub struct Request<'a> {
+    /// Text. A JSON row may also give an object or array, which becomes its `python_json`.
+    #[serde(borrow, deserialize_with = "state_text")]
+    pub state: Cow<'a, str>,
+    #[serde(borrow)]
+    pub question: Cow<'a, str>,
     #[serde(default, rename = "type")]
     pub qtype: QType,
-    pub options: Vec<String>,
+    #[serde(borrow, deserialize_with = "borrowed_strs")]
+    pub options: Vec<Cow<'a, str>>,
+}
+
+/// `Vec<Cow<str>>` that borrows each element where it can. (`#[serde(borrow)]` only reaches a
+/// `Cow` field itself; serde's own `Cow` impl always copies.)
+fn borrowed_strs<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Cow<'de, str>>, D::Error> {
+    #[derive(Deserialize)]
+    struct Text<'a>(#[serde(borrow)] Cow<'a, str>);
+    Ok(Vec::<Text>::deserialize(d)?
+        .into_iter()
+        .map(|t| t.0)
+        .collect())
+}
+
+/// A request's `state`: text as it is, an object or array as `python_json`.
+fn state_text<'de, D: Deserializer<'de>>(d: D) -> Result<Cow<'de, str>, D::Error> {
+    struct State;
+    impl<'de> Visitor<'de> for State {
+        type Value = Cow<'de, str>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("text or a JSON object/array")
+        }
+        fn visit_borrowed_str<E>(self, s: &'de str) -> Result<Self::Value, E> {
+            Ok(s.into())
+        }
+        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E> {
+            Ok(s.to_owned().into())
+        }
+        fn visit_string<E>(self, s: String) -> Result<Self::Value, E> {
+            Ok(s.into())
+        }
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            Ok(python_json(&Value::deserialize(MapAccessDeserializer::new(map))?).into())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            Ok(python_json(&Value::deserialize(SeqAccessDeserializer::new(seq))?).into())
+        }
+    }
+    d.deserialize_any(State)
 }
 
 pub struct Sequence {
@@ -83,15 +133,6 @@ pub fn sequence(
         req.qtype != QType::Noul || req.options.len() == 2,
         "noul options must be ordered [false, true]"
     );
-    let state: Cow<str> = match &req.state {
-        Value::String(s) => s.into(),
-        v @ (Value::Object(_) | Value::Array(_)) => {
-            let mut s = String::new();
-            python_json(v, &mut s);
-            s.into()
-        }
-        _ => bail!("state must be text or a JSON object/array"),
-    };
     let sp = tok.special;
     // `<mask>` in user text would read as an option marker.
     let clean = |t: &str| t.replace(&*tok.mask_token, " ");
@@ -135,7 +176,7 @@ pub fn sequence(
         "question/options exceed the sequence budget; shorten descriptions"
     );
     let start = ids.len();
-    tok.encode(&clean(&state), &mut ids);
+    tok.encode(&clean(&req.state), &mut ids);
     let truncated = ids.len() - start > room;
     ids.truncate(start + room);
     ids.push(sp.sep);
@@ -293,7 +334,9 @@ impl Model {
 
 #[cfg(test)]
 mod tests {
-    use super::python_json;
+    use std::borrow::Cow;
+
+    use super::{Request, python_json};
 
     #[test]
     fn json_like_python() {
@@ -306,5 +349,28 @@ mod tests {
         // json.dumps(json.loads(same text), ensure_ascii=False)
         let want = r#"{"b": [1, -2, 3.0, 0.1, 1e+16, 1.5e-07, 0.0001, -0.0, 123456789.125, -1541722455959009.2, 18446744073709551615], "a": {"s": "q\"\\\n\t\u0001é😀", "e": [], "o": {}, "n": null, "t": true}}"#;
         assert_eq!(s, want);
+    }
+
+    #[test]
+    fn request_borrows_from_the_row() {
+        let row =
+            r#"{"state": {"n": 1, "s": "a\nb"}, "question": "plain", "options": ["x", "y\"z"]}"#;
+        let req: Request = serde_json::from_str(row).unwrap();
+        assert_eq!(req.state, r#"{"n": 1, "s": "a\nb"}"#);
+        assert!(matches!(req.question, Cow::Borrowed("plain")));
+        // An escape has to be decoded, so that string can't point into the row.
+        assert!(matches!(&req.options[..], [Cow::Borrowed("x"), Cow::Owned(o)] if o == "y\"z"));
+
+        let req: Request =
+            serde_json::from_str(r#"{"state": "s", "question": "q", "options": []}"#).unwrap();
+        assert!(matches!(req.state, Cow::Borrowed("s")));
+
+        let err =
+            serde_json::from_str::<Request>(r#"{"state": 42, "question": "q", "options": []}"#);
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("text or a JSON object/array")
+        );
     }
 }
