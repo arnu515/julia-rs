@@ -1,0 +1,36 @@
+# Builds the julia-rs CLI for x86_64 Linux and uploads it as an artifact.
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml pins the nightly; installs it (and its components) with the runner's rustup.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      # ~/.cargo (registry, git) and target/'s dependencies, keyed on the toolchain and Cargo.lock.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # Uploaded as the bare file (no zip). Downloads drop the executable bit: chmod +x after.
+      - uses: actions/upload-artifact@v7
+        with:
+          path: target/release/julia-rs
+          archive: false
+          if-no-files-found: error
